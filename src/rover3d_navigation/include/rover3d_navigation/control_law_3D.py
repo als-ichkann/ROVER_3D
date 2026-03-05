@@ -6,11 +6,11 @@ from scipy.linalg import sqrtm
 from scipy.stats import multivariate_normal
 from scipy.spatial.distance import cdist
 from scipy.optimize import linprog
-from skimage.measure import find_contours
+# from skimage.measure import find_contours
 from sklearn.mixture import GaussianMixture
 import warnings
 import time
-import trimesh
+# import trimesh
 # ESDF: use esdf_map parameter (EsdfMapAdapter)
 # 依赖：init_scene_3D, CVaR_SDF_constraint_3D
 from rover3d_navigation.init_scene_3D import ObstacleManager

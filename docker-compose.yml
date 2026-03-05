@@ -94,6 +94,45 @@ services:
         ros2 launch swarm_lio simulation.launch.py bot_count:=${FISHBOT_AGENT_COUNT:-4} rviz_list:=1 use_sim_time:=true
       "
 
+  mpc_control:
+    container_name: mpc_control
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mpc_control
+      args:
+        BASE_IMAGE: fishbot_base:latest
+    depends_on:
+      - base
+    ipc: host
+    tty: true
+    network_mode: host
+    env_file: ./docker/ros.env
+    volumes:
+      - ./src/mpc_control/:/fishbot_ws/src/mpc_control/
+    command: >
+      bash -lc "ros2 launch mpc_control mpc_control.launch.py robots:=${FISHBOT_NAV_ROBOTS:-bot1,bot2,bot3,bot4}"
+
+  rover3d_navigation:
+    container_name: rover3d_navigation
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rover3d_navigation
+      args:
+        BASE_IMAGE: fishbot_base:latest
+    depends_on:
+      - base
+    network_mode: host
+    ipc: host
+    tty: true
+    env_file: ./docker/ros.env
+    environment:
+      - FISHBOT_NAV_ROBOTS=${FISHBOT_NAV_ROBOTS:-bot1,bot2,bot3,bot4}
+      - MOSEKLM_LICENSE_FILE=${MOSEKLM_LICENSE_FILE:-/home/wang-yb/mosek/mosek.lic}
+    volumes:
+      - ./src/rover3d_navigation/:/fishbot_ws/src/rover3d_navigation/
+    command: >
+      bash -lc "ros2 launch rover3d_navigation planning_apf.launch.py use_gmm_publisher:=true robots:=${FISHBOT_NAV_ROBOTS:-bot1,bot2,bot3,bot4}"
+
   map_fusion:
     container_name: map_fusion
     build:

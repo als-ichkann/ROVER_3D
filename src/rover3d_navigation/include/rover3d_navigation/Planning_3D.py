@@ -14,7 +14,7 @@ import pandas as pd
 import time
 from qpsolvers import solve_qp
 import networkx as nx
-from trimesh.ray import ray_pyembree
+#from trimesh.ray import ray_pyembree
 #import trimesh
 # ESDF: use esdf_map parameter (EsdfMapAdapter) with get_esdf, compute_gradient, is_collision_line_segment, resolution
 
@@ -51,45 +51,45 @@ def shortest_path(Graph):
                 path_existence[node][target] = True
     return path_existence, path_lengths
 
-def check_3d_line_obstacle(start_point, end_point, obstacles):
-    """
-    三维线段与多面体障碍物碰撞检测
-    :param start_point: 线段起点 [x, y, z]
-    :param end_point: 线段终点 [x, y, z]
-    :param obstacles: 障碍物列表，每个元素为trimesh.Trimesh对象
-    :return: 是否碰撞 (True/False)
-    """
-    # create direction vector
-    direction = np.array(end_point) - np.array(start_point)
-    norm = np.linalg.norm(direction)
-    if norm < 1e-6:  # 零长度线段
-        return False
+# def check_3d_line_obstacle(start_point, end_point, obstacles):
+#     """
+#     三维线段与多面体障碍物碰撞检测
+#     :param start_point: 线段起点 [x, y, z]
+#     :param end_point: 线段终点 [x, y, z]
+#     :param obstacles: 障碍物列表，每个元素为trimesh.Trimesh对象
+#     :return: 是否碰撞 (True/False)
+#     """
+#     # create direction vector
+#     direction = np.array(end_point) - np.array(start_point)
+#     norm = np.linalg.norm(direction)
+#     if norm < 1e-6:  # 零长度线段
+#         return False
     
-    # 转换为trimesh射线格式
-    ray_origins = np.array([start_point])
-    ray_directions = np.array([direction / norm])  # 单位化
+#     # 转换为trimesh射线格式
+#     ray_origins = np.array([start_point])
+#     ray_directions = np.array([direction / norm])  # 单位化
     
-    # 遍历所有障碍物
-    for obstacle in obstacles:
-        # 获取障碍物的边界表示
-        mesh = obstacle
+#     # 遍历所有障碍物
+#     for obstacle in obstacles:
+#         # 获取障碍物的边界表示
+#         mesh = obstacle
         
-        # 进行射线相交检测
-        intersector = ray_pyembree.RayMeshIntersector(mesh)
-        locations, _, _ = intersector.intersects_location(
-            ray_origins=ray_origins,
-            ray_directions=ray_directions)
+#         # 进行射线相交检测
+#         intersector = ray_pyembree.RayMeshIntersector(mesh)
+#         locations, _, _ = intersector.intersects_location(
+#             ray_origins=ray_origins,
+#             ray_directions=ray_directions)
         
-        # 检查交点是否在线段范围内
-        if len(locations) > 0:
-            for loc in locations:
-                # 计算参数t (0 <= t <= 1)
-                vec = loc - start_point
-                t = np.dot(vec, direction) / np.dot(direction, direction)
-                if 0 <= t <= 1:
-                    return True
+#         # 检查交点是否在线段范围内
+#         if len(locations) > 0:
+#             for loc in locations:
+#                 # 计算参数t (0 <= t <= 1)
+#                 vec = loc - start_point
+#                 t = np.dot(vec, direction) / np.dot(direction, direction)
+#                 if 0 <= t <= 1:
+#                     return True
                     
-    return False
+#     return False
 def notgreedy_genPathTable(current_means, current_covs, current_weights, fmeans, fcovs, fweights, conbinedmeans_list,
                            conbinedcovs_list, esdf_map , Graph_GC, Wasserstein_table):
     

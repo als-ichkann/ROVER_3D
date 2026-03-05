@@ -1,0 +1,26 @@
+ARG BASE_IMAGE=fishbot_base:latest
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /fishbot_ws
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip \
+    && pip3 install --no-cache-dir "numpy>=1.21,<2.0" "scipy>=1.8" "qpsolvers" \
+    && apt-get clean
+
+COPY src/mpc_control/package.xml src/mpc_control/
+RUN rosdep update \
+    && rosdep install --rosdistro humble --from-paths src/mpc_control --ignore-src -y
+
+COPY src/mpc_control/ src/mpc_control/
+
+RUN source /opt/ros/humble/setup.bash \
+    && colcon build --merge-install --symlink-install \
+        --packages-select mpc_control
+
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
