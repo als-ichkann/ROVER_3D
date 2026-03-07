@@ -98,6 +98,7 @@ namespace esdf_map
         publish_full_grid_ = declare_parameter<bool>("publish_full_grid", true);
         publish_roi_grid_ = declare_parameter<bool>("publish_roi_grid", true);
         publish_costmap_2d_ = declare_parameter<bool>("publish_costmap_2d", true);
+        grid_max_distance_ = declare_parameter<double>("grid_max_distance", 2.0);
         costmap_layer_z_ = declare_parameter<double>("costmap_layer_z", 0.5);
         costmap_free_distance_ = declare_parameter<double>("costmap_free_distance", 0.5);
         costmap_lethal_distance_ = declare_parameter<double>("costmap_lethal_distance", 0.1);
@@ -399,55 +400,47 @@ namespace esdf_map
 
         const auto t_get = std::chrono::steady_clock::now();
 
-        std::size_t N = 0;
+        std::vector<esdf_map::VoxelSample> filtered;
+        filtered.reserve(1024 * 64);
         {
             auto locked = full_region ? core_->getAllLockedVoxels()
                                     : core_->getLockedVoxelView(roi);
             const auto& view = locked.view();
-            N = view.count();
-            if (N == 0) return;
+            if (view.count() == 0) return;
 
-            recordTiming(full_region ? "get_voxels" : "get_voxels_roi", std::chrono::steady_clock::now() - t_get);
-
-            const auto t_pub = std::chrono::steady_clock::now();
-
-            // Explicitly size the message to avoid iterator overruns.
-            const uint32_t point_step = static_cast<uint32_t>(4 * sizeof(float));
-            msg.point_step = point_step;
-            msg.height = 1;
-            msg.width = static_cast<uint32_t>(N);
-            msg.row_step = point_step * msg.width;
-            msg.is_dense = false;
-            msg.data.assign(static_cast<size_t>(msg.row_step) * msg.height, 0u);
-
-            float *data_ptr = reinterpret_cast<float *>(msg.data.data());
-            const size_t max_floats = static_cast<size_t>(msg.width) * 4u;
-            size_t idx = 0;
-            bool overflowed = false;
-
+            const float max_d = static_cast<float>(grid_max_distance_);
             view.forEach([&](const esdf_map::VoxelSample& v) {
-                if (idx + 4 > max_floats) {
-                    overflowed = true;
-                    return;
-                }
-                data_ptr[idx++] = v.x;
-                data_ptr[idx++] = v.y;
-                data_ptr[idx++] = v.z;
-                data_ptr[idx++] = v.distance;
+                if (v.distance <= max_d) filtered.push_back(v);
             });
-
-            if (overflowed || idx != max_floats) {
-                RCLCPP_WARN(get_logger(),
-                    "publishGrid truncated/overflow: full=%d count=%zu filled=%zu",
-                    full_region ? 1 : 0, static_cast<size_t>(N), idx / 4);
-            }
-
-            msg.header.stamp = this->get_clock()->now();
-            msg.header.frame_id = world_frame_;
-            pub->publish(msg);
-
-            recordTiming(full_region ? "publish_esdf" : "publish_esdf_roi", std::chrono::steady_clock::now() - t_pub);
         }
+        if (filtered.empty()) return;
+
+        recordTiming(full_region ? "get_voxels" : "get_voxels_roi", std::chrono::steady_clock::now() - t_get);
+
+        const auto t_pub = std::chrono::steady_clock::now();
+        const std::size_t N = filtered.size();
+        const uint32_t point_step = static_cast<uint32_t>(4 * sizeof(float));
+        msg.point_step = point_step;
+        msg.height = 1;
+        msg.width = static_cast<uint32_t>(N);
+        msg.row_step = point_step * msg.width;
+        msg.is_dense = false;
+        msg.data.assign(static_cast<size_t>(msg.row_step) * msg.height, 0u);
+
+        float *data_ptr = reinterpret_cast<float *>(msg.data.data());
+        for (size_t i = 0; i < N; ++i) {
+            const auto& v = filtered[i];
+            data_ptr[i * 4 + 0] = v.x;
+            data_ptr[i * 4 + 1] = v.y;
+            data_ptr[i * 4 + 2] = v.z;
+            data_ptr[i * 4 + 3] = v.distance;
+        }
+
+        msg.header.stamp = this->get_clock()->now();
+        msg.header.frame_id = world_frame_;
+        pub->publish(msg);
+
+        recordTiming(full_region ? "publish_esdf" : "publish_esdf_roi", std::chrono::steady_clock::now() - t_pub);
     }
 
 

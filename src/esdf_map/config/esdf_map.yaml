@@ -40,6 +40,7 @@ esdf_map_node:
     publish_full_grid: true          # enable /esdf/grid
     publish_roi_grid: false          # enable /esdf/grid_roi - region of interenst (part that was updated)
     publish_costmap_2d: true         # enable /esdf/costmap_2d
+    grid_max_distance: 1.0           # [m] only publish voxels with distance <= this (avoid red block in rviz)
 
     costmap_layer_z: 0.5             # [m] slice height in world_frame
     costmap_free_distance: 2.5       # [m] dist >= free -> cost=0

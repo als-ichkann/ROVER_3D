@@ -141,6 +141,7 @@ namespace esdf_map
         bool publish_full_grid_{true};
         bool publish_roi_grid_{true};
         bool publish_costmap_2d_{true};
+        double grid_max_distance_{2.0};  // only publish voxels with distance <= this [m]
 
         double costmap_layer_z_{0.5};
         double costmap_free_distance_{0.5};
