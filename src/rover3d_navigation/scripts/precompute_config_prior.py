@@ -8,7 +8,8 @@ Node_PDF_table_3D.npy、Graph_GC_3D.npy。
 
 用法（从 workspace 根目录）:
   cd /path/to/fishbot_multirobot_sim
-  PYTHONPATH=src/rover3d_navigation/include python3 src/rover3d_navigation/scripts/precompute_config_prior.py
+  # 源码运行需将包根目录加入 PYTHONPATH（rover3d_navigation 包位于 src/rover3d_navigation/rover3d_navigation/）
+  PYTHONPATH=src/rover3d_navigation python3 src/rover3d_navigation/scripts/precompute_config_prior.py
 
 或使用 colcon 构建后:
   source install/setup.bash
@@ -31,13 +32,11 @@ import sys
 import numpy as np
 from scipy.stats import multivariate_normal
 
-# 添加路径以便导入 rover3d_navigation（支持源码或 install 目录）
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _pkg_root = os.path.dirname(os.path.dirname(_script_dir))
-# 源码：include/ 目录（包含 rover3d_navigation 包）
-_include = os.path.join(_pkg_root, "include")
-if os.path.isdir(_include):
-    sys.path.insert(0, os.path.abspath(_include))
+_pkg_dir = os.path.join(_pkg_root, "rover3d_navigation")
+if os.path.isdir(_pkg_dir):
+    sys.path.insert(0, os.path.abspath(_pkg_root))
 
 try:
     import yaml

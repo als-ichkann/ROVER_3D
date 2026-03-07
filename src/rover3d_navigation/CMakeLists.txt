@@ -4,8 +4,8 @@ project(rover3d_navigation)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 
-# Python library from include/rover3d_navigation
-install(DIRECTORY include/rover3d_navigation/
+# Python library (conventional layout: rover3d_navigation/ at package root)
+install(DIRECTORY rover3d_navigation/
   DESTINATION lib/python3.10/site-packages/rover3d_navigation
 )
 
