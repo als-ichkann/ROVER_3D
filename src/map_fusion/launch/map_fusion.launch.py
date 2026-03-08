@@ -22,6 +22,8 @@ def _launch_setup(context, *args, **kwargs):
 
             "publish_rate_hz": 0.5,
             "voxel_leaf_size": 0.1,
+            "filter_high_intensity": True,
+            "intensity_max_threshold": 1000.0,
 
             "combined_map_topic": "/global_downsampled_map",
             "origin_frame": "map_origin",

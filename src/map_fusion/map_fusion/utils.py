@@ -62,6 +62,42 @@ def pcd_to_xyz_fast(msg: PointCloud2, skip_rate:int=1) -> np.ndarray:
     return pts[::skip_rate] if skip_rate > 1 else pts
 
 
+def pcd_to_xyzi_fast(msg: PointCloud2, skip_rate: int = 1) -> tuple[np.ndarray, np.ndarray | None]:
+    """
+    Return (xyz Nx3, intensity Nx1 or None if no intensity field).
+    Used for filtering high-reflectivity points (teammates) before ESDF.
+    """
+    field_names = [f.name for f in msg.fields]
+    if not all(k in field_names for k in ('x', 'y', 'z')):
+        return np.zeros((0, 3), dtype=np.float32), None
+    if 'intensity' not in field_names:
+        return pcd_to_xyz_fast(msg, skip_rate), None
+
+    def _get_offset(name: str) -> int:
+        for f in msg.fields:
+            if f.name == name:
+                return f.offset
+        return -1
+
+    oi = _get_offset('intensity')
+    if oi < 0:
+        return pcd_to_xyz_fast(msg, skip_rate), None
+
+    dt = np.dtype([
+        ('x', np.float32), ('y', np.float32), ('z', np.float32),
+        ('_pad', f'V{max(0, oi - 12)}'),
+        ('intensity', np.float32),
+        ('_rest', f'V{max(0, msg.point_step - oi - 4)}'),
+    ])
+    raw = np.frombuffer(msg.data, dtype=dt)
+    pts = np.vstack((raw['x'], raw['y'], raw['z'])).T.astype(np.float32)
+    intensity = raw['intensity'].reshape(-1, 1).astype(np.float32)
+    if skip_rate > 1:
+        pts = pts[::skip_rate]
+        intensity = intensity[::skip_rate]
+    return pts, intensity
+
+
 # ------------------Fast Voxelization----------------------
 def voxelize_numpy(pts: np.ndarray, voxel_size: float=0.1) -> np.ndarray:
     """Fastest voxel filter"""

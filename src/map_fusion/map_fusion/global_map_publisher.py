@@ -19,7 +19,7 @@ from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
-from map_fusion.utils import BotFrameResolver, quat_to_rot_matrix, pcd_to_xyz_fast, voxelize_numpy
+from map_fusion.utils import BotFrameResolver, quat_to_rot_matrix, pcd_to_xyz_fast, pcd_to_xyzi_fast, voxelize_numpy
 
 
 @dataclass
@@ -46,6 +46,8 @@ class MapFusionNode(Node):
         self.declare_parameter('combined_map_topic', '/global_downsampled_map')
         self.declare_parameter('origin_frame', 'map_origin')
         self.declare_parameter('voxel_leaf_size', 0.1)
+        self.declare_parameter('filter_high_intensity', True)
+        self.declare_parameter('intensity_max_threshold', 1000.0)
         self.declare_parameter('debug_profile', True)
         self.declare_parameter('debug_profile_every', 10)
 
@@ -56,6 +58,8 @@ class MapFusionNode(Node):
         self.combined_map_topic: str = str(self.get_parameter('combined_map_topic').value)
         rate_hz: float = float(self.get_parameter('publish_rate_hz').value)
         self.voxel_size: float = float(self.get_parameter('voxel_leaf_size').value)
+        self.filter_high_intensity: bool = bool(self.get_parameter('filter_high_intensity').value)
+        self.intensity_max_threshold: float = float(self.get_parameter('intensity_max_threshold').value)
         self.debug_profile: bool = bool(self.get_parameter('debug_profile').value)
         self.debug_profile_every: int = int(self.get_parameter('debug_profile_every').value)
         self._profile_count: int = 0
@@ -108,7 +112,8 @@ class MapFusionNode(Node):
         self.get_logger().info(
             f"global_map_node TF-fusion started. global_frame={self.origin_frame_id}, "
             f"combined_map_topic={self.combined_map_topic}, tf children=/{self.bot_prefix}<id>/{self.bot_cloud_frame}, "
-            f"cloud_topic=/{self.bot_prefix}<id>/{self.bot_cloud_topic}, voxel_size={self.voxel_size}"
+            f"cloud_topic=/{self.bot_prefix}<id>/{self.bot_cloud_topic}, voxel_size={self.voxel_size}, "
+            f"filter_high_intensity={self.filter_high_intensity}, intensity_max_threshold={self.intensity_max_threshold}"
         )
 
     def _register_bot(self, bot_id: int | None) -> None:
@@ -129,7 +134,15 @@ class MapFusionNode(Node):
 
     def _map_callback(self, uid: int, msg: PointCloud2) -> None:
         t0 = time.perf_counter()
-        pts = voxelize_numpy(pcd_to_xyz_fast(msg), self.voxel_size)
+        xyz, intensity = pcd_to_xyzi_fast(msg)
+        if xyz.size == 0:
+            return
+        if self.filter_high_intensity and intensity is not None:
+            mask = intensity.ravel() <= self.intensity_max_threshold
+            xyz = xyz[mask]
+        if xyz.size == 0:
+            return
+        pts = voxelize_numpy(xyz, self.voxel_size)
         if pts.size == 0:
             return
 
