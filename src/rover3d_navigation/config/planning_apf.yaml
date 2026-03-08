@@ -9,6 +9,8 @@ planning_apf_node:
     gmm_interp_steps: 5
     use_gmm_trajectory_slp: true
     esdf_service: "esdf/query"
+    esdf_grid_topic: "/esdf/grid_full"
+    use_esdf_grid_cache: true
     esdf_frame_id: "map_origin"
     map_origin_x: -5.0
     map_origin_y: -7.5

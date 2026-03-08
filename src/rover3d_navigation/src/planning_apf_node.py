@@ -12,7 +12,7 @@ import numpy as np
 import rclpy
 from navigation_msgs.msg import GMM
 from rover3d_navigation.ROVER_3D import PlanningAPFProcess
-from rover3d_navigation.esdf_adapter import EsdfMapAdapter
+from rover3d_navigation.esdf_adapter import EsdfMapAdapter, EsdfGridCache
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
@@ -37,6 +37,8 @@ class PlanningAPFNode(Node):
         self.declare_parameter("gmm_interp_steps", 5)
         self.declare_parameter("use_gmm_trajectory_slp", True)
         self.declare_parameter("esdf_service", "esdf/query")
+        self.declare_parameter("esdf_grid_topic", "/esdf/grid_full")
+        self.declare_parameter("use_esdf_grid_cache", True)
         self.declare_parameter("esdf_frame_id", "map_origin")
         self.declare_parameter("map_origin_x", -5.0)
         self.declare_parameter("map_origin_y", -7.5)
@@ -99,18 +101,33 @@ class PlanningAPFNode(Node):
                 Path, f"{name}/{self._traj_suffix}", 10
             )
 
-        self._esdf = EsdfMapAdapter(
-            self,
-            service_name=self.get_parameter("esdf_service").value,
-            frame_id=self.get_parameter("esdf_frame_id").value,
-            map_origin_x=float(self.get_parameter("map_origin_x").value),
-            map_origin_y=float(self.get_parameter("map_origin_y").value),
-            map_origin_z=float(self.get_parameter("map_origin_z").value),
-            map_size_x=float(self.get_parameter("map_size_x").value),
-            map_size_y=float(self.get_parameter("map_size_y").value),
-            map_size_z=float(self.get_parameter("map_size_z").value),
-            resolution=float(self.get_parameter("esdf_resolution").value),
-        )
+        use_cache = bool(self.get_parameter("use_esdf_grid_cache").value)
+        if use_cache:
+            self._esdf = EsdfGridCache(
+                self,
+                grid_topic=str(self.get_parameter("esdf_grid_topic").value),
+                frame_id=self.get_parameter("esdf_frame_id").value,
+                map_origin_x=float(self.get_parameter("map_origin_x").value),
+                map_origin_y=float(self.get_parameter("map_origin_y").value),
+                map_origin_z=float(self.get_parameter("map_origin_z").value),
+                map_size_x=float(self.get_parameter("map_size_x").value),
+                map_size_y=float(self.get_parameter("map_size_y").value),
+                map_size_z=float(self.get_parameter("map_size_z").value),
+                resolution=float(self.get_parameter("esdf_resolution").value),
+            )
+        else:
+            self._esdf = EsdfMapAdapter(
+                self,
+                service_name=self.get_parameter("esdf_service").value,
+                frame_id=self.get_parameter("esdf_frame_id").value,
+                map_origin_x=float(self.get_parameter("map_origin_x").value),
+                map_origin_y=float(self.get_parameter("map_origin_y").value),
+                map_origin_z=float(self.get_parameter("map_origin_z").value),
+                map_size_x=float(self.get_parameter("map_size_x").value),
+                map_size_y=float(self.get_parameter("map_size_y").value),
+                map_size_z=float(self.get_parameter("map_size_z").value),
+                resolution=float(self.get_parameter("esdf_resolution").value),
+            )
 
         self.create_timer(1.0 / self._control_rate, self._control_loop)
         self.get_logger().info(
@@ -168,6 +185,8 @@ class PlanningAPFNode(Node):
     def _control_loop(self) -> None:
         if self._gmm_goal is None:
             self._publish_empty_paths()
+            return
+        if hasattr(self._esdf, "is_ready") and not self._esdf.is_ready:
             return
         robots_positions = self._get_robots_positions()
         if robots_positions is None or len(robots_positions) == 0:
