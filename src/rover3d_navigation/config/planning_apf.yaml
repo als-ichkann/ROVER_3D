@@ -19,5 +19,5 @@ planning_apf_node:
     map_size_y: 17.0
     map_size_z: 6.0
     esdf_resolution: 0.15
-    grid_step: 3.0
+    grid_step: 2.0
     config_dir: ""

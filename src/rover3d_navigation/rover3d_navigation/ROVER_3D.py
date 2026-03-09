@@ -42,6 +42,43 @@ def _find_mean_index(means_list, mean) -> int:
     raise ValueError(f"Mean {mean} not found in means_list")
 
 
+def _map_goals_to_nearest_gc(
+    goal_means: list,
+    goal_covs: list,
+    goal_weights: list,
+    GC_means: list,
+    GC_covs: list,
+) -> tuple:
+    """
+    将发布的目标点映射到最近的离散 GC 节点。
+    多个目标映射到同一 GC 时合并权重。
+    :return: (fmeans, fcovs, fweights) 目标均已在 GC 节点集合内
+    """
+    if not goal_means or not GC_means:
+        return [], [], []
+
+    gm_arr = np.asarray(goal_means, dtype=float).reshape(-1, 3)
+    gc_arr = np.asarray(GC_means, dtype=float).reshape(-1, 3)
+    weights = list(goal_weights) if goal_weights else [1.0] * len(goal_means)
+    while len(weights) < len(goal_means):
+        weights.append(1.0)
+    weights = weights[: len(goal_means)]
+
+    from collections import defaultdict
+    merged: dict = defaultdict(float)
+    for i, gm in enumerate(gm_arr):
+        dists = np.linalg.norm(gc_arr - gm, axis=1)
+        best_idx = int(np.argmin(dists))
+        merged[best_idx] += weights[i]
+
+    idx_order = sorted(merged.keys())
+    fmeans = [list(GC_means[i]) for i in idx_order]
+    fcovs = [np.asarray(GC_covs[i]).reshape(3, 3) if np.size(GC_covs[i]) == 9 else GC_covs[i] for i in idx_order]
+    total_w = sum(merged.values())
+    fweights = [merged[i] / total_w for i in idx_order]
+    return fmeans, fcovs, fweights
+
+
 def _adj_to_graph(adj: np.ndarray, n: int) -> "nx.DiGraph":
     """将邻接矩阵转为 networkx 有向图。"""
     G = nx.DiGraph()
@@ -84,9 +121,6 @@ class PlanningAPFProcess:
         self.xa, self.xb = xa, xb
         self.ya, self.yb = ya, yb
         self.za, self.zb = za, zb
-        self.fmeans = [list(m) for m in goal_means]
-        self.fcovs = [np.asarray(c).reshape(3, 3) if np.size(c) == 9 else c for c in goal_covs]
-        self.fweights = list(goal_weights)
         self.gmm_interp_steps = gmm_interp_steps
         self.max_apf_try = max_apf_try
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
@@ -120,8 +154,16 @@ class PlanningAPFProcess:
                 mean_table = [[(xa + xb) / 2, (ya + yb) / 2, (za + zb) / 2]]
             self.GC_means, self.GC_covs = init_Graph_CVaR_3D.init_GC_Nodes(mean_table)
 
-        self.conbinedmeans_list = self.fmeans + self.GC_means
-        self.conbinedcovs_list = self.fcovs + self.GC_covs
+        # 发布的目标点自动归并到最近的离散 GC 节点
+        self.fmeans, self.fcovs, self.fweights = _map_goals_to_nearest_gc(
+            goal_means, goal_covs, goal_weights, self.GC_means, self.GC_covs
+        )
+        # 节点列表仅含 GC 离散节点，不含目标点（目标已映射到 GC）
+        self.conbinedmeans_list = list(self.GC_means)
+        self.conbinedcovs_list = [
+            np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+            for c in self.GC_covs
+        ]
         Numnode = len(self.conbinedmeans_list)
 
         # Wasserstein 与 Node_PDF 表：优先从 config 加载

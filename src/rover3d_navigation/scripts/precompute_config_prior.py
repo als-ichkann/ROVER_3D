@@ -2,13 +2,14 @@
 """
 预计算 rover3d_navigation 的 config 先验文件。
 
-根据 esdf_map.yaml 的地图坐标定义，以及 gmm_goal_publisher.yaml 的默认目标，
-生成 GC_means_3D.json、GC_covs_3D.json、Wasserstein_table_3D.npy、
-Node_PDF_table_3D.npy、Graph_GC_3D.npy。
+根据 FIESTA 的地图配置（lx, ly, lz, rx, ry, rz）生成纯离散 GC 节点图，不包含目标点。
+发布的目标点将在运行时自动归并到最近的离散 GC 节点。
+
+输出：GC_means_3D.json、GC_covs_3D.json、Wasserstein_table_3D.npy、
+      Node_PDF_table_3D.npy、Graph_GC_3D.npy。
 
 用法（从 workspace 根目录）:
   cd /path/to/fishbot_multirobot_sim
-  # 源码运行需将包根目录加入 PYTHONPATH（rover3d_navigation 包位于 src/rover3d_navigation/rover3d_navigation/）
   PYTHONPATH=src/rover3d_navigation python3 src/rover3d_navigation/scripts/precompute_config_prior.py
 
 或使用 colcon 构建后:
@@ -16,10 +17,9 @@ Node_PDF_table_3D.npy、Graph_GC_3D.npy。
   python3 src/rover3d_navigation/scripts/precompute_config_prior.py
 
 可选参数:
-  --esdf-config   esdf_map.yaml 路径
-  --goal-config   gmm_goal_publisher.yaml 路径
-  --output        输出目录
-  --grid-step     GC 节点网格步长 (默认 3.0，需与 planning_apf.yaml 一致)
+  --fiesta-config  FIESTA fiesta.yaml 路径
+  --output         输出目录
+  --grid-step      GC 节点网格步长 (默认 2.0，需与 planning_apf.yaml 一致)
 """
 
 from __future__ import annotations
@@ -51,59 +51,24 @@ def load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def get_map_params(esdf_config_path: str) -> dict:
-    """从 esdf_map.yaml 读取地图参数。"""
-    data = load_yaml(esdf_config_path)
-    params = data.get("esdf_map_node", {}).get("ros__parameters", data)
+def get_map_params_from_fiesta(fiesta_config_path: str) -> dict:
+    """从 FIESTA fiesta.yaml 读取地图参数 (lx, ly, lz, rx, ry, rz)。"""
+    data = load_yaml(fiesta_config_path)
+    params = data.get("fiesta_node", {}).get("ros__parameters", data)
+    lx = float(params.get("lx", -5.0))
+    ly = float(params.get("ly", -7.5))
+    lz = float(params.get("lz", 0.0))
+    rx = float(params.get("rx", 17.0))
+    ry = float(params.get("ry", 9.5))
+    rz = float(params.get("rz", 6.0))
     return {
-        "map_origin_x": float(params.get("map_origin_x", -5.0)),
-        "map_origin_y": float(params.get("map_origin_y", -7.5)),
-        "map_origin_z": float(params.get("map_origin_z", 0.0)),
-        "map_size_x": float(params.get("map_size_x", 22.0)),
-        "map_size_y": float(params.get("map_size_y", 17.0)),
-        "map_size_z": float(params.get("map_size_z", 6.0)),
+        "map_origin_x": lx,
+        "map_origin_y": ly,
+        "map_origin_z": lz,
+        "map_size_x": rx - lx,
+        "map_size_y": ry - ly,
+        "map_size_z": rz - lz,
     }
-
-
-def get_goal_params(goal_config_path: str) -> tuple:
-    """从 gmm_goal_publisher.yaml 读取目标 GMM 参数。"""
-    data = load_yaml(goal_config_path)
-    params = data.get("gmm_goal_publisher", {}).get("ros__parameters", data)
-    means_raw = params.get("means", [[3.0, 0.0, 1.0]])
-    cov_scale = float(params.get("default_covariance_scale", 0.5))
-    weights_raw = params.get("weights", [1.0])
-
-    if isinstance(means_raw[0], (int, float)):
-        means = [list(means_raw)]
-    else:
-        means = [[float(m[0]), float(m[1]), float(m[2])] for m in means_raw]
-
-    n = len(means)
-    weights = [float(w) for w in weights_raw[:n]]
-    while len(weights) < n:
-        weights.append(1.0)
-    weights = weights[:n]
-    total = sum(weights)
-    if total > 0:
-        weights = [w / total for w in weights]
-
-    covs = []
-    covs_raw = params.get("covariances", [])
-    if len(covs_raw) >= n * 9:
-        for i in range(n):
-            c = list(covs_raw[i * 9 : (i + 1) * 9])
-            if len(c) == 9:
-                covs.append(np.array(c).reshape(3, 3).tolist())
-        if len(covs) == n:
-            return means, covs, weights
-
-    for _ in range(n):
-        covs.append([
-            [cov_scale, 0, 0],
-            [0, cov_scale, 0],
-            [0, 0, cov_scale],
-        ])
-    return means, covs, weights
 
 
 def main() -> None:
@@ -112,25 +77,15 @@ def main() -> None:
     )
     # 默认路径：从 workspace 根目录运行 (cwd = fishbot_multirobot_sim)
     _cwd = os.getcwd()
-    _esdf_candidates = [
-        os.path.join(_cwd, "src", "esdf_map", "config", "esdf_map.yaml"),
-        os.path.join(_pkg_root, "..", "esdf_map", "config", "esdf_map.yaml"),
+    _fiesta_candidates = [
+        os.path.join(_cwd, "src", "FIESTA", "config", "fiesta.yaml"),
+        os.path.join(_pkg_root, "..", "FIESTA", "config", "fiesta.yaml"),
     ]
-    _esdf_default = next((p for p in _esdf_candidates if os.path.exists(p)), _esdf_candidates[0])
+    _fiesta_default = next((p for p in _fiesta_candidates if os.path.exists(p)), _fiesta_candidates[0])
     parser.add_argument(
-        "--esdf-config",
-        default=_esdf_default,
-        help="esdf_map.yaml 路径",
-    )
-    _goal_candidates = [
-        os.path.join(_pkg_root, "config", "gmm_goal_publisher.yaml"),
-        os.path.join(_cwd, "src", "rover3d_navigation", "config", "gmm_goal_publisher.yaml"),
-    ]
-    _goal_default = next((p for p in _goal_candidates if os.path.exists(p)), _goal_candidates[0])
-    parser.add_argument(
-        "--goal-config",
-        default=_goal_default,
-        help="gmm_goal_publisher.yaml 路径",
+        "--fiesta-config",
+        default=_fiesta_default,
+        help="FIESTA fiesta.yaml 路径",
     )
     _out_default = os.path.join(_pkg_root, "config")
     if not os.path.isdir(_out_default):
@@ -143,7 +98,7 @@ def main() -> None:
     parser.add_argument(
         "--grid-step",
         type=float,
-        default=3.0,
+        default=2.0,
         help="GC 节点网格步长 [m]，与 planning_apf grid_step 一致",
     )
     args = parser.parse_args()
@@ -154,21 +109,17 @@ def main() -> None:
             p = os.path.join(os.getcwd(), p)
         return os.path.normpath(p)
 
-    esdf_path = _norm(args.esdf_config)
-    goal_path = _norm(args.goal_config)
+    fiesta_path = _norm(args.fiesta_config)
     output_dir = _norm(args.output)
     grid_step = args.grid_step
 
-    if not os.path.exists(esdf_path):
-        print(f"错误: esdf 配置不存在: {esdf_path}")
-        sys.exit(1)
-    if not os.path.exists(goal_path):
-        print(f"错误: goal 配置不存在: {goal_path}")
+    if not os.path.exists(fiesta_path):
+        print(f"错误: FIESTA 配置不存在: {fiesta_path}")
         sys.exit(1)
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 读取地图参数
-    map_p = get_map_params(esdf_path)
+    # 1. 从 FIESTA 配置读取地图参数
+    map_p = get_map_params_from_fiesta(fiesta_path)
     xa = map_p["map_origin_x"]
     ya = map_p["map_origin_y"]
     za = map_p["map_origin_z"]
@@ -177,11 +128,7 @@ def main() -> None:
     zb = za + map_p["map_size_z"]
     print(f"地图边界: x=[{xa}, {xb}], y=[{ya}, {yb}], z=[{za}, {zb}]")
 
-    # 2. 读取目标 GMM
-    fmeans, fcovs, fweights = get_goal_params(goal_path)
-    print(f"目标 GMM: {len(fmeans)} 个分量")
-
-    # 3. 生成 GC 节点
+    # 2. 生成离散 GC 节点（不包含目标点，目标在运行时归并到最近 GC）
     from rover3d_navigation import init_Graph_CVaR_3D
 
     mean_table = []
@@ -193,14 +140,11 @@ def main() -> None:
         mean_table = [[(xa + xb) / 2, (ya + yb) / 2, (za + zb) / 2]]
 
     GC_means, GC_covs = init_Graph_CVaR_3D.init_GC_Nodes(mean_table)
-    print(f"GC 节点数: {len(GC_means)}")
+    print(f"GC 节点数: {len(GC_means)} （纯离散节点，不含目标点）")
 
-    # 4. 合并节点：fmeans + GC_means（与 ROVER_3D 一致）
-    conbinedmeans_list = list(fmeans) + list(GC_means)
+    # 3. 使用 GC 节点构建图（目标点运行时归并到最近 GC）
+    conbinedmeans_list = list(GC_means)
     conbinedcovs_list = []
-    for c in fcovs:
-        arr = np.array(c) if not hasattr(c, "shape") else c
-        conbinedcovs_list.append(arr.reshape(3, 3) if np.size(arr) == 9 else arr)
     for c in GC_covs:
         arr = np.array(c) if not hasattr(c, "shape") else c
         conbinedcovs_list.append(arr.reshape(3, 3) if np.size(arr) == 9 else arr)
@@ -208,7 +152,7 @@ def main() -> None:
     Numnode = len(conbinedmeans_list)
     print(f"总节点数: {Numnode}")
 
-    # 5. 计算 Wasserstein 与 Node_PDF 表
+    # 4. 计算 Wasserstein 与 Node_PDF 表
     from rover3d_navigation import control_law_3D
 
     print("计算 Wasserstein 与 Node_PDF 表...")
@@ -229,14 +173,14 @@ def main() -> None:
                 m1, mean=np.array(m2), cov=c2
             )
 
-    # 6. 构建 Graph_GC（邻接矩阵）
+    # 5. 构建 Graph_GC（邻接矩阵）
     print("构建 Graph_GC...")
     Graph_adj = init_Graph_CVaR_3D.init_Graph_GC(
         conbinedmeans_list, conbinedcovs_list, Wasserstein_table,
         xa=xa, ya=ya, za=za, xb=xb, yb=yb, zb=zb,
     )
 
-    # 7. 保存
+    # 6. 保存
     path_means = os.path.join(output_dir, "GC_means_3D.json")
     path_covs = os.path.join(output_dir, "GC_covs_3D.json")
     path_w = os.path.join(output_dir, "Wasserstein_table_3D.npy")
