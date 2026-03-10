@@ -1,7 +1,7 @@
 planning_apf_node:
   ros__parameters:
     robot_names: ["bot1", "bot2", "bot3", "bot4"]
-    odom_suffix: "gt/odom"
+    odom_suffix: "global_odom"   # Swarm-LIO2 + map_fusion 全局定位
     goal_topic: "apf_goal"
     trajectory_suffix: "apf_trajectory"
     control_rate: 5.0

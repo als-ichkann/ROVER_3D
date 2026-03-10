@@ -29,7 +29,7 @@ class PlanningAPFNode(Node):
         super().__init__("planning_apf_node")
 
         self.declare_parameter("robot_names", ["bot1", "bot2"])
-        self.declare_parameter("odom_suffix", "gt/odom")
+        self.declare_parameter("odom_suffix", "global_odom")
         self.declare_parameter("goal_topic", "apf_goal")
         self.declare_parameter("trajectory_suffix", "apf_trajectory")
         self.declare_parameter("control_rate", 5.0)

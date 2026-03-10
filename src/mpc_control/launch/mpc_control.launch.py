@@ -3,6 +3,7 @@
 MPC Drone Control Launch
 
 为每台机器人启动 MPC 轨迹跟踪控制器，订阅 apf_trajectory，发布 cmd_vel。
+定位统一使用 Swarm-LIO2 + map_fusion 发布的 global_odom。
 
 使用方法:
   ros2 launch mpc_control mpc_control.launch.py
@@ -10,7 +11,7 @@ MPC Drone Control Launch
 
 前提：
   - planning_apf 节点已运行，并发布 /{robot}/apf_trajectory
-  - 仿真/定位发布 /{robot}/gt/odom
+  - map_fusion 节点已运行，发布 /{robot}/global_odom（依赖 Swarm-LIO2）
 """
 from typing import List
 
@@ -28,6 +29,7 @@ def _mpc_control_setup(context, *args, **kwargs):
     robots_raw = LaunchConfiguration("robots").perform(context)
     vel_scale = LaunchConfiguration("velocity_scale", default="1.0").perform(context)
     min_speed = LaunchConfiguration("min_speed", default="0.15").perform(context)
+    odom_suffix = LaunchConfiguration("odom_suffix", default="global_odom").perform(context)
     robot_names = _parse_robot_names(robots_raw)
 
     nodes = []
@@ -40,9 +42,11 @@ def _mpc_control_setup(context, *args, **kwargs):
                 name=f"mpc_drone_control_{name}",
                 namespace=name,
                 output="screen",
-                parameters=[{"velocity_scale": float(vel_scale), "min_speed": float(min_speed)}],
+                parameters=[
+                    {"velocity_scale": float(vel_scale), "min_speed": float(min_speed), "odom_suffix": odom_suffix}
+                ],
                 remappings=[
-                    ("gt/odom", f"{prefix}/gt/odom"),
+                    (odom_suffix, f"{prefix}/{odom_suffix}"),
                     ("trajectory", f"{prefix}/apf_trajectory"),
                     ("cmd_vel", f"{prefix}/cmd_vel"),
                 ],
@@ -75,6 +79,11 @@ def generate_launch_description() -> LaunchDescription:
             "min_speed",
             default_value="0.15",
             description="轨迹跟踪时的最小速度 (m/s)，避免输出过小无人机不动",
+        ),
+        DeclareLaunchArgument(
+            "odom_suffix",
+            default_value="global_odom",
+            description="定位话题：global_odom (Swarm-LIO2+map_fusion)，可改为 gt/odom 用于纯仿真",
         ),
         OpaqueFunction(function=_mpc_control_setup),
     ])

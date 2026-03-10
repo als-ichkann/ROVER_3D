@@ -1,7 +1,7 @@
 /**:
     ros__parameters:
         input_topic:
-            odom_topic: wheel_odom
+            odom_topic: global_odom    # Swarm-LIO2 + map_fusion 全局定位
             goal_topic: move_base/goal
 
         output_topic:
@@ -9,7 +9,7 @@
             nav_status_topic: nav_status
             nav_path_topic: nav_path
 
-        path_frame: odom
+        path_frame: map_origin         # 与 global_odom 坐标系一致
         align_final_heading: true
 
         controller:

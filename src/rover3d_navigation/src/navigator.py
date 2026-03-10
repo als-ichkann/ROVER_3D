@@ -44,12 +44,12 @@ class NavigatorNode(Node):
     def __init__(self) -> None:
         super().__init__('navigator')
         self.robot_name = self.declare_parameter('robot_name', value='').value or 'fishbot'
-        self.declare_parameter('input_topic.odom_topic', 'wheel_odom')
+        self.declare_parameter('input_topic.odom_topic', 'global_odom')
         self.declare_parameter('input_topic.goal_topic', 'move_base/goal')
         self.declare_parameter('output_topic.cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('output_topic.nav_status_topic', 'nav_status')
         self.declare_parameter('output_topic.nav_path_topic', 'nav_path')
-        self.declare_parameter('path_frame', 'odom')
+        self.declare_parameter('path_frame', 'map_origin')
         self.declare_parameter('align_final_heading', True)
         self.declare_parameter('controller.control_rate', 20.0)
         self.declare_parameter('controller.max_linear_speed', 0.8)

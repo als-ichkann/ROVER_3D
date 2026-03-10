@@ -20,7 +20,7 @@ It assumes every robot provides the topics `/ROBOT/odom` and `/ROBOT/cmd_vel` pl
 
 ## Topics & services
 
-- Subscribes to `/ROBOT/wheel_odom` (configurable) and `/ROBOT/move_base/goal`.
+- Subscribes to `/ROBOT/global_odom` (Swarm-LIO2 + map_fusion) and `/ROBOT/move_base/goal`.
 - Publishes `/ROBOT/cmd_vel`, `/ROBOT/nav_status` and `/ROBOT/nav_path`.
 - Exposes `/ROBOT/cancel_navigation` (`std_srvs/Trigger`), clearing the current goal.
 
@@ -53,7 +53,7 @@ Key entries:
 
 ### Planning APF Topics
 
-- Subscribes: `/{robot}/gt/odom` (or `wheel_odom`), `apf_goal` (`navigation_msgs/GMM`)
+- Subscribes: `/{robot}/global_odom` (Swarm-LIO2 + map_fusion), `apf_goal` (`navigation_msgs/GMM`)
 - Publishes: `/{robot}/apf_trajectory` (`nav_msgs/Path`)
 - Uses: `esdf/query` service (optional, for obstacle avoidance)
 

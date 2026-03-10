@@ -2,7 +2,8 @@
 """
 MPC Drone Control ROS2 Node
 
-订阅 gt/odom、trajectory (apf_trajectory)，执行 MPC 轨迹跟踪，发布 cmd_vel (Twist)。
+订阅 global_odom（Swarm-LIO2 + map_fusion 全局定位）、trajectory (apf_trajectory)，
+执行 MPC 轨迹跟踪，发布 cmd_vel (Twist)。
 用于控制仿真中的无人机，运动接口符合 geometry_msgs/Twist。
 """
 
@@ -21,8 +22,9 @@ class MPCDroneControlNode(Node):
         super().__init__("mpc_drone_control")
         self.declare_parameter("control_dt", 0.1)
         self.declare_parameter("control_frequency", 10)
-        self.declare_parameter("velocity_scale", 500.0)
+        self.declare_parameter("velocity_scale", 1.0)
         self.declare_parameter("min_speed", 0.15)
+        self.declare_parameter("odom_suffix", "global_odom")
         dt = float(self.get_parameter("control_dt").value)
         self._dt = dt
         self._control_frequency = float(self.get_parameter("control_frequency").value)
@@ -43,9 +45,10 @@ class MPCDroneControlNode(Node):
         self._actual_state = np.zeros((1, 12))
         self._num_robots = 1
 
-        # 订阅 / 发布
+        # 订阅 / 发布（定位：global_odom = Swarm-LIO2 + map_fusion）
+        self._odom_suffix = str(self.get_parameter("odom_suffix").value)
         self._odom_sub = self.create_subscription(
-            Odometry, "gt/odom", self._odom_cb, 10
+            Odometry, self._odom_suffix, self._odom_cb, 10
         )
         self._traj_sub = self.create_subscription(
             Path, "trajectory", self._trajectory_cb, 10

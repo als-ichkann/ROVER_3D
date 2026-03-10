@@ -11,8 +11,9 @@ ESDF 建图、MPC 控制等由其他 launch 负责启动。
 
 逻辑:
   1. use_gmm_publisher:=true 时启动 gmm_goal_publisher，发布 apf_goal (GMM)
-  2. planning_apf_node: 订阅 apf_goal、/{robot}/gt/odom，调用 esdf/query 避障，
+  2. planning_apf_node: 订阅 apf_goal、/{robot}/global_odom（Swarm-LIO2+map_fusion），订阅 /esdf/grid_full（FIESTA 发布的完整 ESDF 栅格）做 local 避障查询，
      运行 SLP 宏观优化 + APF 势场，发布 /{robot}/apf_trajectory
+     （use_esdf_grid_cache:=true 时订阅 topic；false 时改调用 esdf/query 服务）
 """
 from typing import List
 
