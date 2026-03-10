@@ -12,7 +12,7 @@ import numpy as np
 import rclpy
 from navigation_msgs.msg import GMM
 from rover3d_navigation.ROVER_3D import PlanningAPFProcess
-from rover3d_navigation.esdf_adapter import EsdfMapAdapter, EsdfGridCache
+from rover3d_navigation.esdf_adapter import EsdfMapAdapter, EsdfGridCache, EsdfShmAdapter
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
@@ -39,6 +39,8 @@ class PlanningAPFNode(Node):
         self.declare_parameter("esdf_service", "esdf/query")
         self.declare_parameter("esdf_grid_topic", "/esdf/grid_full")
         self.declare_parameter("use_esdf_grid_cache", True)
+        self.declare_parameter("esdf_mode", "grid_cache")  # grid_cache | shm | service
+        self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
         self.declare_parameter("esdf_frame_id", "map_origin")
         self.declare_parameter("map_origin_x", -5.0)
         self.declare_parameter("map_origin_y", -7.5)
@@ -101,8 +103,21 @@ class PlanningAPFNode(Node):
                 Path, f"{name}/{self._traj_suffix}", 10
             )
 
-        use_cache = bool(self.get_parameter("use_esdf_grid_cache").value)
-        if use_cache:
+        esdf_mode = str(self.get_parameter("esdf_mode").value).lower()
+        if esdf_mode == "shm":
+            self._esdf = EsdfShmAdapter(
+                self,
+                shm_name=str(self.get_parameter("esdf_shm_name").value),
+                frame_id=self.get_parameter("esdf_frame_id").value,
+                map_origin_x=float(self.get_parameter("map_origin_x").value),
+                map_origin_y=float(self.get_parameter("map_origin_y").value),
+                map_origin_z=float(self.get_parameter("map_origin_z").value),
+                map_size_x=float(self.get_parameter("map_size_x").value),
+                map_size_y=float(self.get_parameter("map_size_y").value),
+                map_size_z=float(self.get_parameter("map_size_z").value),
+                resolution=float(self.get_parameter("esdf_resolution").value),
+            )
+        elif esdf_mode == "grid_cache" or self.get_parameter("use_esdf_grid_cache").value:
             self._esdf = EsdfGridCache(
                 self,
                 grid_topic=str(self.get_parameter("esdf_grid_topic").value),
@@ -186,6 +201,8 @@ class PlanningAPFNode(Node):
         if self._gmm_goal is None:
             self._publish_empty_paths()
             return
+        if hasattr(self._esdf, "refresh"):
+            self._esdf.refresh()
         if hasattr(self._esdf, "is_ready") and not self._esdf.is_ready:
             return
         robots_positions = self._get_robots_positions()

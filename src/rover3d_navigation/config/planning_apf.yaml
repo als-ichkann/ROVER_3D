@@ -11,6 +11,8 @@ planning_apf_node:
     esdf_service: "esdf/query"
     esdf_grid_topic: "/esdf/grid_full"
     use_esdf_grid_cache: true
+    esdf_mode: "shm"         # shm | grid_cache | service. shm=共享内存零拷贝，需 FIESTA use_esdf_shm:=true
+    esdf_shm_name: "/fiesta_esdf"
     esdf_frame_id: "map_origin"
     map_origin_x: -5.0
     map_origin_y: -7.5
