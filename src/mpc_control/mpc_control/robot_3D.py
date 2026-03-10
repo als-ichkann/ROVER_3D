@@ -88,12 +88,12 @@ class MPC_3D:
         self.agents = []
         time_interval = np.zeros((num_robots, int(self.discrete_points.shape[1] / 3 - 1)))
         # time_interval = np.zeros((Ncar,len(mulist)-1))
-        # set time interval
+        # set time interval（移除 np.ceil，允许亚秒级时间，下限为 dt，避免密集点被强加 1 秒导致龟速）
         for i in range(self.discrete_points.shape[0]):
             for j in range(0, self.discrete_points.shape[1] - 5, 3):
-                time_interval[i, int(j / 3)] = np.ceil(
-                    np.linalg.norm(self.discrete_points[i, j:j + 3] - self.discrete_points[i, j + 3:j + 6]) / self.v_max * 4 / 3)
-        self.time_interval = np.ceil(np.sum(time_interval, axis=0) / 1)
+                dist = np.linalg.norm(self.discrete_points[i, j:j + 3] - self.discrete_points[i, j + 3:j + 6])
+                time_interval[i, int(j / 3)] = max(dist / self.v_max * 4 / 3, self.dt)
+        self.time_interval = np.sum(time_interval, axis=0)
         self.reshapedPoints = self.discrete_points          # 直接引用已整理好的 (Ncar, T*3) 数组
         for i in range(self.Ncar):
             traj_i   = self.reshapedPoints[i].reshape(-1, 3)         # (T, 3)
@@ -111,9 +111,8 @@ class MPC_3D:
 
         for i in range(self.Ncar):
             for j in range(0, trajectories.shape[1] - 5, 3):
-                time_interval_mat[i, j // 3] = np.ceil(
-                    np.linalg.norm(trajectories[i, j:j + 3] -
-                                trajectories[i, j + 3:j + 6]) / self.v_max * 4 / 3)
+                dist = np.linalg.norm(trajectories[i, j:j + 3] - trajectories[i, j + 3:j + 6])
+                time_interval_mat[i, j // 3] = max(dist / self.v_max * 4 / 3, self.dt)
 
         for i in range(self.Ncar):
             traj_i   = trajectories[i].reshape(-1, 3)               # 不再手动 vstack

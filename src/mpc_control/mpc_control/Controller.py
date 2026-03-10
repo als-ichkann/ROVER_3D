@@ -51,12 +51,13 @@ def controller(agent, u, n):
     #     omega_vec[2] = 1.0 * yaw_error
     omega_mag = float(np.linalg.norm(omega_vec))
 
-    # ===== 速度限幅 =====
+    # ===== 速度限幅（修复：真正修改速度向量，而非仅改标量 v_mag）=====
     v_mag = float(np.linalg.norm(v_vec_next))
-    if v_mag < vbound:
-        v_mag = vbound
-    if v_mag > vmax:
-        v_mag = vmax
+    if v_mag > 1e-9 and v_mag < vbound:
+        v_vec_next = v_vec_next / v_mag * vbound
+    elif v_mag > vmax:
+        v_vec_next = v_vec_next / v_mag * vmax
+    v_mag = float(np.linalg.norm(v_vec_next))  # 限幅后重新计算，供返回值使用
 
     # ===== 姿态更新（逐轴积分）=====
     theta_next = theta + omega_vec * dt

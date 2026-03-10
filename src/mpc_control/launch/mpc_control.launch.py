@@ -26,7 +26,7 @@ def _parse_robot_names(raw: str) -> List[str]:
 
 def _mpc_control_setup(context, *args, **kwargs):
     robots_raw = LaunchConfiguration("robots").perform(context)
-    vel_scale = LaunchConfiguration("velocity_scale", default="500.0").perform(context)
+    vel_scale = LaunchConfiguration("velocity_scale", default="1.0").perform(context)
     min_speed = LaunchConfiguration("min_speed", default="0.15").perform(context)
     robot_names = _parse_robot_names(robots_raw)
 
@@ -68,8 +68,8 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "velocity_scale",
-            default_value="500.0",
-            description="MPC 速度输出增益（MPC 输出很小，需大倍数放大）",
+            default_value="1.0",
+            description="MPC 速度输出增益（修复双重插值后 MPC 输出已是物理速度，默认 1.0）",
         ),
         DeclareLaunchArgument(
             "min_speed",

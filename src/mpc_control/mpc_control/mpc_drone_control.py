@@ -99,7 +99,8 @@ class MPCDroneControlNode(Node):
             self._new_trajectory_flag = True
 
     def _build_mpc_from_trajectory(self, current_pos, trajectory_raw):
-        """根据当前位置和原始轨迹，构建/更新 MPC"""
+        """根据当前位置和原始轨迹，构建/更新 MPC
+        """
         from . import robot_3D
 
         clipped = robot_3D.get_3d_trajectories(current_pos, [trajectory_raw])
@@ -109,35 +110,18 @@ class MPCDroneControlNode(Node):
 
         traj_clipped = clipped[0]
         pos = np.array(current_pos).reshape(-1, 3)
-        # 构造 start_trajectory：当前位置 -> 轨迹首点
-        start_traj = np.vstack((pos, traj_clipped[0:1]))
-        v_max = 0.3
-        NT = 1000
-        dt = self._dt
 
-        n_seg = max(1, start_traj.shape[0] - 1)
-        time_interval = np.zeros(n_seg)
-        for j in range(n_seg):
-            diff = start_traj[j + 1] - start_traj[j]
-            time_interval[j] = np.ceil(np.linalg.norm(diff) / v_max * 4 / 3)
-        time_interval = np.maximum(time_interval, 1.0)
-        ref_pts = robot_3D.referencePoints(start_traj, time_interval, NT, dt)
-        ref_pts = robot_3D.remove_after_close_points(ref_pts, 1e-4)
-
-        # 拼接：平滑段 + 截取轨迹
-        rp = np.vstack((ref_pts[:-1], traj_clipped))
+        rp = np.vstack((pos, traj_clipped))
         if len(rp) < 2:
             rp = np.vstack((rp, rp[-1:]))
 
-        # MPC.control() 期望: start_point=[[x,y,z]], trajectories=[[[x,y,z],[x,y,z],...]]
         start_point = [list(current_pos)]
         trajectories = [rp.tolist()]
 
         if self._mpc is None:
-            # 首次创建：需要 dummy discrete_points 满足 __init__，每行至少 2 个点 (6 个标量) 以计算 time_interval
             dummy = [[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0], [4.0, 4.0, 4.0], [5.0, 5.0, 5.0]]]
             self._mpc = robot_3D.MPC_3D(
-                num_robots=1, N=6, dt=dt, discrete_points=dummy
+                num_robots=1, N=6, dt=self._dt, discrete_points=dummy
             )
 
         self._mpc.control(start_point, trajectories)
@@ -192,14 +176,12 @@ class MPCDroneControlNode(Node):
         NT = mpc.NT
 
         if self._current_step >= NT:
-            # 轨迹已完成
-            v = np.array(getattr(agent, "velocity", [0, 0, 0]), dtype=float) * self._velocity_scale
+            # 轨迹已完成（MPC 输出已是物理速度，直接信任）
+            v = np.array(getattr(agent, "velocity", [0, 0, 0]), dtype=float)
             v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
             v_norm = np.linalg.norm(v)
             if v_norm > 1e-9 and v_norm < self._min_speed:
                 v = v / v_norm * self._min_speed
-            if v_norm > 0.5:
-                v = v / v_norm * 0.5
             ov = np.nan_to_num(np.array(getattr(agent, "angular_velocity", [0, 0, 0])), nan=0.0, posinf=0.0, neginf=0.0)
             # 世界系 -> 机体系（MulticopterVelocityControl 期望机体系 cmd_vel）
             v_body = self._world_to_body_velocity(v, state[9])
@@ -239,18 +221,14 @@ class MPCDroneControlNode(Node):
             self._state = np.copy(actual_state[0])
             self._current_step += 1
 
-        # 发布 Twist：放大 MPC 输出并施加最小速度（MPC 输出过小导致无人机不动）
+        # 发布 Twist：MPC 输出已是物理速度（v_max=0.3），直接信任；仅施加 min_speed 防卡死
         v = np.array(agent.velocity, dtype=float)
         if not np.isfinite(v).all():
             self.get_logger().warn_throttle(1.0, "MPC velocity contains NaN/inf, clamping to 0")
         v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-        v = v * self._velocity_scale
         v_norm = np.linalg.norm(v)
         if v_norm > 1e-9 and v_norm < self._min_speed:
             v = v / v_norm * self._min_speed
-        v_norm = np.linalg.norm(v)
-        if v_norm > 0.5:  # 限制最大速度
-            v = v / v_norm * 0.5
         ov = np.array(getattr(agent, "angular_velocity", [0.0, 0.0, 0.0]), dtype=float)
         if not np.isfinite(ov).all():
             self.get_logger().warn_throttle(1.0, "MPC angular_velocity contains NaN/inf, clamping to 0")
