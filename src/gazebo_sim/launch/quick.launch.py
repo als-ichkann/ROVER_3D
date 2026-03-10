@@ -11,7 +11,7 @@ def generate_launch_description() -> LaunchDescription:
     """Launch Gazebo and delegate robot spawning to spawn_robots.launch.py."""
     pkg_share = get_package_share_directory('gazebo_sim')
 
-    default_world = os.environ.get('GAZEBO_WORLD', 'fishbot2.world')
+    default_world = os.environ.get('GAZEBO_WORLD', 'sim.world')
 
     declare_args = [
         DeclareLaunchArgument('world', default_value=default_world),

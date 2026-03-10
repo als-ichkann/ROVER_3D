@@ -62,21 +62,26 @@ class MPCDroneControlNode(Node):
         x, y, z, w = q.x, q.y, q.z, q.w
         return np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
+    def _world_to_body_velocity(self, v_world, yaw):
+        """将世界坐标系速度转为机体坐标系（MulticopterVelocityControl 期望机体系）"""
+        cy = np.cos(-yaw)
+        sy = np.sin(-yaw)
+        v_body_x = v_world[0] * cy - v_world[1] * sy
+        v_body_y = v_world[0] * sy + v_world[1] * cy
+        v_body_z = v_world[2]  # Z 轴不受 yaw 影响
+        return np.array([v_body_x, v_body_y, v_body_z])
+
     def _odom_cb(self, msg):
-        """从 Odometry 更新 state"""
+        """从 Odometry 更新 state。TF 来源的 Odom 不含线速度，故只更新位置和 yaw，不读假速度。"""
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
-        vx = msg.twist.twist.linear.x
-        vy = msg.twist.twist.linear.y
-        vz = msg.twist.twist.linear.z
         yaw = self._quat_to_yaw(q)
         with self._lock:
             self._state[0] = p.x
             self._state[3] = p.y
             self._state[6] = p.z
-            self._state[1] = vx
-            self._state[4] = vy
-            self._state[7] = vz
+            # 不读 Odom 中的 twist（TF 不提供，恒为 0），速度由 MPC 预测值维持
+            # self._state[1], [4], [7] 由 _control_timer_cb 中 MPC 输出写回
             self._state[9] = yaw
             self._state_valid = True
 
@@ -196,10 +201,12 @@ class MPCDroneControlNode(Node):
             if v_norm > 0.5:
                 v = v / v_norm * 0.5
             ov = np.nan_to_num(np.array(getattr(agent, "angular_velocity", [0, 0, 0])), nan=0.0, posinf=0.0, neginf=0.0)
+            # 世界系 -> 机体系（MulticopterVelocityControl 期望机体系 cmd_vel）
+            v_body = self._world_to_body_velocity(v, state[9])
             twist = Twist()
-            twist.linear.x = float(v[0])
-            twist.linear.y = float(v[1])
-            twist.linear.z = float(v[2])
+            twist.linear.x = float(v_body[0])
+            twist.linear.y = float(v_body[1])
+            twist.linear.z = float(v_body[2])
             twist.angular.x = float(ov[0])
             twist.angular.y = float(ov[1])
             twist.angular.z = float(ov[2])
@@ -227,7 +234,7 @@ class MPCDroneControlNode(Node):
             self._cmd_pub.publish(twist)
             return
 
-        # 更新本地状态
+        # 更新本地状态：actual_state[0] 已含 MPC 预测的速度（controller 写回），不再被 Odom 假速度覆盖
         with self._lock:
             self._state = np.copy(actual_state[0])
             self._current_step += 1
@@ -248,10 +255,13 @@ class MPCDroneControlNode(Node):
         if not np.isfinite(ov).all():
             self.get_logger().warn_throttle(1.0, "MPC angular_velocity contains NaN/inf, clamping to 0")
         ov = np.nan_to_num(ov, nan=0.0, posinf=0.0, neginf=0.0)
+        # 世界系 -> 机体系（MulticopterVelocityControl 期望机体系 cmd_vel）
+        yaw = state[9]
+        v_body = self._world_to_body_velocity(v, yaw)
         twist = Twist()
-        twist.linear.x = float(v[0])
-        twist.linear.y = float(v[1])
-        twist.linear.z = float(v[2])
+        twist.linear.x = float(v_body[0])
+        twist.linear.y = float(v_body[1])
+        twist.linear.z = float(v_body[2])
         twist.angular.x = float(ov[0])
         twist.angular.y = float(ov[1])
         twist.angular.z = float(ov[2])

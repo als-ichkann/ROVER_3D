@@ -40,32 +40,23 @@ def controller(agent, u, n):
     # x_{k+1} = x_k + v_k dt + 0.5 a_k dt^2 + (1/6) j dt^3
     pos_next   = currentPosition + lastVelo * dt + 0.5 * lastAcce * dt**2 + (1.0/6.0) * u * dt**3
 
-    # ===== 角速度（曲率关系）：omega = (v × a) / ||v||^2 =====
-    v_mag_sq = float(np.dot(v_vec_next, v_vec_next))
-    if v_mag_sq < 1e-6:
-        v_mag_sq = 1e-6
-    omega_vec = np.cross(v_vec_next, a_vec_next) / v_mag_sq
+    # ===== 角速度 =====
+    # 曲率公式 omega=(v×a)/||v||^2 针对轮式底盘，四旋翼不适用；MulticopterVelocityControl 下直接置零
+    # 可选：若需机头朝向飞行方向，可启用下方 Yaw P 控制
+    omega_vec = np.array([0.0, 0.0, 0.0], dtype=float)
+    # if float(np.linalg.norm(v_vec_next[:2])) > 0.1:
+    #     target_yaw = np.arctan2(v_vec_next[1], v_vec_next[0])
+    #     yaw_error = target_yaw - theta[0]
+    #     yaw_error = (yaw_error + np.pi) % (2 * np.pi) - np.pi
+    #     omega_vec[2] = 1.0 * yaw_error
     omega_mag = float(np.linalg.norm(omega_vec))
 
-    # ===== 速度与角速度限幅/增益 =====
+    # ===== 速度限幅 =====
     v_mag = float(np.linalg.norm(v_vec_next))
     if v_mag < vbound:
         v_mag = vbound
     if v_mag > vmax:
         v_mag = vmax
-
-    if omega_mag > bound:
-        omega_vec = omega_vec * (bound / omega_mag)
-        omega_mag = bound
-
-    # 线速度较大时，降低角速度（经验调节）
-    if (v_mag - vbound) >= 0.01:
-        omega_vec *= 0.7
-        omega_mag *= 0.7
-
-    # 消除微小角速度
-    omega_vec[np.abs(omega_vec) < 1e-3] = 0.0
-    omega_mag = float(np.linalg.norm(omega_vec))  # 重新计算幅值
 
     # ===== 姿态更新（逐轴积分）=====
     theta_next = theta + omega_vec * dt
