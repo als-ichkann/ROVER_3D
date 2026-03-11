@@ -5,6 +5,7 @@ import time
 from copy import deepcopy
 from qpsolvers import solve_qp, Problem, solve_problem
 from .Controller import controller
+from .esdf_constraint import compute_esdf_inequality_constraints
 
 
 def get_3d_trajectories(current_points, points_list):
@@ -50,11 +51,13 @@ class Agent_3D:
         self.path = np.array(self.initialPosition, dtype=float).reshape(1, 3)
 
 class MPC_3D:
-    def __init__(self, num_robots, N, dt, discrete_points, *args):
+    def __init__(self, num_robots, N, dt, discrete_points, *args, esdf_adapter=None, esdf_d_safe=0.3):
 
         self.discrete_points = np.array(discrete_points).reshape((num_robots, len(discrete_points[0]) * 3))  #原始列表为二维的,现将其改为三维的
         if len(args) > 0:
             self.eng = args[0]
+        self.esdf_adapter = esdf_adapter      # 可选：EsdfShmAdapter/EsdfGridCache 等零拷贝 adapter
+        self.esdf_d_safe = esdf_d_safe        # ESDF 安全距离 [m]
         self.num_robots = num_robots
         self.Ncar = self.num_robots
         self.N = N  # Prediction total steps
@@ -426,6 +429,22 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
     # 总不等式：纵向拼接
     Fnew = np.vstack([F_state, F_ctrl])      # 行数 = 18*(N+1) + 6N = 18*7 + 36 = 162
     gnew = np.hstack([g_state, g_ctrl])      # 长度同上
+
+    # =========== ESDF 避障不等式约束（可选，零拷贝 adapter 直接读） ============
+    if getattr(Controller, "esdf_adapter", None) is not None:
+        if hasattr(Controller.esdf_adapter, "refresh"):
+            Controller.esdf_adapter.refresh()
+        positions = np.array([
+            agent.rp[min(t + k, agent.rp.shape[0] - 1)] for t in range(Controller.N + 1)
+        ])
+        d_safe = getattr(Controller, "esdf_d_safe", 0.3)
+        F_esdf, g_esdf = compute_esdf_inequality_constraints(
+            positions, d_safe, Controller.esdf_adapter,
+            n_state=Controller.n, n_control=Controller.m, n_horizon=Controller.N,
+        )
+        if F_esdf.shape[0] > 0:
+            Fnew = np.vstack([Fnew, F_esdf])
+            gnew = np.hstack([gnew, g_esdf])
 
     # ===========（可选）松弛变量：在列右侧补 slacknum 列零 ============
     slacknum = 0

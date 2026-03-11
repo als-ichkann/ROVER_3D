@@ -13,6 +13,7 @@
   <depend>nav_msgs</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>rover3d_navigation</depend>
   <depend>python3-numpy</depend>
   <depend>python3-scipy</depend>
   <depend>python3-qpsolvers-pip</depend>

@@ -30,7 +30,25 @@ def _mpc_control_setup(context, *args, **kwargs):
     vel_scale = LaunchConfiguration("velocity_scale", default="1.0").perform(context)
     min_speed = LaunchConfiguration("min_speed", default="0.15").perform(context)
     odom_suffix = LaunchConfiguration("odom_suffix", default="global_odom").perform(context)
+    use_esdf = LaunchConfiguration("use_esdf", default="false").perform(context)
+    esdf_mode = LaunchConfiguration("esdf_mode", default="shm").perform(context)
+    esdf_shm_name = LaunchConfiguration("esdf_shm_name", default="/fiesta_esdf").perform(context)
+    esdf_grid_topic = LaunchConfiguration("esdf_grid_topic", default="/esdf/grid_full").perform(context)
+    esdf_frame_id = LaunchConfiguration("esdf_frame_id", default="map_origin").perform(context)
+    esdf_d_safe = LaunchConfiguration("esdf_d_safe", default="0.3").perform(context)
     robot_names = _parse_robot_names(robots_raw)
+
+    params = {
+        "velocity_scale": float(vel_scale),
+        "min_speed": float(min_speed),
+        "odom_suffix": odom_suffix,
+        "use_esdf": use_esdf.lower() in ("true", "1", "yes"),
+        "esdf_mode": esdf_mode,
+        "esdf_shm_name": esdf_shm_name,
+        "esdf_grid_topic": esdf_grid_topic,
+        "esdf_frame_id": esdf_frame_id,
+        "esdf_d_safe": float(esdf_d_safe),
+    }
 
     nodes = []
     for name in robot_names:
@@ -42,9 +60,7 @@ def _mpc_control_setup(context, *args, **kwargs):
                 name=f"mpc_drone_control_{name}",
                 namespace=name,
                 output="screen",
-                parameters=[
-                    {"velocity_scale": float(vel_scale), "min_speed": float(min_speed), "odom_suffix": odom_suffix}
-                ],
+                parameters=[params],
                 remappings=[
                     (odom_suffix, f"{prefix}/{odom_suffix}"),
                     ("trajectory", f"{prefix}/apf_trajectory"),
@@ -73,7 +89,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "velocity_scale",
             default_value="1.0",
-            description="MPC 速度输出增益（修复双重插值后 MPC 输出已是物理速度，默认 1.0）",
+            description="MPC 速度输出增益",
         ),
         DeclareLaunchArgument(
             "min_speed",
@@ -84,6 +100,21 @@ def generate_launch_description() -> LaunchDescription:
             "odom_suffix",
             default_value="global_odom",
             description="定位话题：global_odom (Swarm-LIO2+map_fusion)，可改为 gt/odom 用于纯仿真",
+        ),
+        DeclareLaunchArgument(
+            "use_esdf",
+            default_value="false",
+            description="是否启用 ESDF 避障不等式约束（零拷贝：shm 或 grid_cache）",
+        ),
+        DeclareLaunchArgument(
+            "esdf_mode",
+            default_value="shm",
+            description="ESDF 模式：shm=共享内存零拷贝，grid_cache=订阅 /esdf/grid_full",
+        ),
+        DeclareLaunchArgument(
+            "esdf_d_safe",
+            default_value="0.3",
+            description="ESDF 安全距离 [m]，机器人中心到障碍物表面的最小距离",
         ),
         OpaqueFunction(function=_mpc_control_setup),
     ])
