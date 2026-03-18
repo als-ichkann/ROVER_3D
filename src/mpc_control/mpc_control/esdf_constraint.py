@@ -1,20 +1,58 @@
 """
 ESDF 不等式约束接口，用于 MPC 避障。
 
-从 SHM 零拷贝读取 ESDF 中参考点的梯度 ∇d 和距离 d(p_ref)，基于 ESDF 场函数一阶泰勒展开：
+从 SHM 零拷贝读取 ESDF，采用三线性插值（参考 zhuanlan.zhihu.com/p/671385710）获取
+无人机位置的精确距离 d(p_ref) 与梯度 ∇d，基于一阶泰勒展开：
 
     d(p) ≈ d(p_ref) + ∇d^T (p - p_ref)
 
 避障约束 d(p) >= d_safe 化为：
 
     ∇d^T p >= ∇d^T p_ref + d_safe - d(p_ref)
-
-QP 标准形 F z <= g 下，取 F = -∇d^T，g = -(∇d^T p_ref + d_safe - d(p_ref))。
 """
 
 from typing import Optional, Tuple, Union
 
 import numpy as np
+
+
+def make_mpc_esdf_adapter(raw_adapter):
+    """将 EsdfShmAdapter 包装为 MPC 专用 adapter，使用三线性插值获取精确 ESDF。"""
+    if raw_adapter is None:
+        return None
+    if hasattr(raw_adapter, "query_trilinear_mpc"):
+        return MpcEsdfTrilinearAdapter(raw_adapter)
+    return raw_adapter
+
+
+class MpcEsdfTrilinearAdapter:
+    """MPC 专用 ESDF 适配器，通过三线性插值获取无人机位置的精确距离与梯度。"""
+
+    def __init__(self, raw_adapter):
+        self._adapter = raw_adapter
+
+    def get_esdf(self, pos):
+        pos = np.asarray(pos, dtype=float).flatten()[:3]
+        if len(pos) < 3:
+            return 5.0
+        d, _ = self._adapter.query_trilinear_mpc(float(pos[0]), float(pos[1]), float(pos[2]))
+        return float(d)
+
+    def compute_gradient(self, pos):
+        pos = np.asarray(pos, dtype=float).flatten()[:3]
+        if len(pos) < 3:
+            return np.zeros(3)
+        _, g = self._adapter.query_trilinear_mpc(float(pos[0]), float(pos[1]), float(pos[2]))
+        return g
+
+    @property
+    def origin(self):
+        return self._adapter.origin
+
+    def refresh(self):
+        if hasattr(self._adapter, "refresh"):
+            return self._adapter.refresh()
+        return False
 
 
 def compute_esdf_inequality_constraints(

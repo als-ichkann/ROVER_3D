@@ -26,9 +26,7 @@ class MPCDroneControlNode(Node):
         self.declare_parameter("min_speed", 0.15)
         self.declare_parameter("odom_suffix", "global_odom")
         self.declare_parameter("use_esdf", False)
-        self.declare_parameter("esdf_mode", "shm")
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
-        self.declare_parameter("esdf_grid_topic", "/esdf/grid_full")
         self.declare_parameter("esdf_frame_id", "map_origin")
         self.declare_parameter("esdf_d_safe", 0.3)
         self.declare_parameter("map_origin_x", -5.0)
@@ -60,8 +58,7 @@ class MPCDroneControlNode(Node):
         self._esdf_adapter = None
         if self.get_parameter("use_esdf").value:
             try:
-                from rover3d_navigation.esdf_adapter import EsdfShmAdapter, EsdfGridCache
-                mode = str(self.get_parameter("esdf_mode").value).lower()
+                from rover3d_navigation.esdf_adapter import EsdfShmAdapter
                 kw = dict(
                     frame_id=str(self.get_parameter("esdf_frame_id").value),
                     map_origin_x=float(self.get_parameter("map_origin_x").value),
@@ -72,17 +69,12 @@ class MPCDroneControlNode(Node):
                     map_size_z=float(self.get_parameter("map_size_z").value),
                     resolution=float(self.get_parameter("esdf_resolution").value),
                 )
-                if mode == "shm":
-                    self._esdf_adapter = EsdfShmAdapter(
-                        self, shm_name=str(self.get_parameter("esdf_shm_name").value), **kw
-                    )
-                else:
-                    self._esdf_adapter = EsdfGridCache(
-                        self, grid_topic=str(self.get_parameter("esdf_grid_topic").value), **kw
-                    )
+                self._esdf_adapter = EsdfShmAdapter(
+                    self, shm_name=str(self.get_parameter("esdf_shm_name").value), **kw
+                )
                 self.get_logger().info(
-                    "ESDF constraint enabled (zero-copy): mode=%s, d_safe=%.2f"
-                    % (mode, self.get_parameter("esdf_d_safe").value)
+                    "ESDF constraint enabled (SHM + trilinear): d_safe=%.2f"
+                    % self.get_parameter("esdf_d_safe").value
                 )
             except Exception as e:
                 self.get_logger().warn("ESDF constraint disabled: %s" % e)
@@ -166,9 +158,11 @@ class MPCDroneControlNode(Node):
         if self._mpc is None:
             dummy = [[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [3.0, 3.0, 3.0], [4.0, 4.0, 4.0], [5.0, 5.0, 5.0]]]
             esdf_d_safe = float(self.get_parameter("esdf_d_safe").value)
+            from .esdf_constraint import make_mpc_esdf_adapter
+            mpc_adapter = make_mpc_esdf_adapter(self._esdf_adapter)
             self._mpc = robot_3D.MPC_3D(
                 num_robots=1, N=6, dt=self._dt, discrete_points=dummy,
-                esdf_adapter=self._esdf_adapter,
+                esdf_adapter=mpc_adapter,
                 esdf_d_safe=esdf_d_safe,
             )
 

@@ -427,38 +427,11 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
     g_ctrl = gU_big
 
     # 总不等式：纵向拼接
-    Fnew = np.vstack([F_state, F_ctrl])      # 行数 = 18*(N+1) + 6N = 18*7 + 36 = 162
-    gnew = np.hstack([g_state, g_ctrl])      # 长度同上
-
-    # =========== ESDF 避障不等式约束（可选，零拷贝 adapter 直接读） ============
-    if getattr(Controller, "esdf_adapter", None) is not None:
-        if hasattr(Controller.esdf_adapter, "refresh"):
-            Controller.esdf_adapter.refresh()
-        positions = np.array([
-            agent.rp[min(t + k, agent.rp.shape[0] - 1)] for t in range(Controller.N + 1)
-        ])
-        d_safe = getattr(Controller, "esdf_d_safe", 0.3)
-        F_esdf, g_esdf = compute_esdf_inequality_constraints(
-            positions, d_safe, Controller.esdf_adapter,
-            n_state=Controller.n, n_control=Controller.m, n_horizon=Controller.N,
-        )
-        if F_esdf.shape[0] > 0:
-            Fnew = np.vstack([Fnew, F_esdf])
-            gnew = np.hstack([gnew, g_esdf])
-
-    # ===========（可选）松弛变量：在列右侧补 slacknum 列零 ============
-    slacknum = 0
-    Hnew = block_diag(Controller.H, np.eye(slacknum) * Controller.penalty)
-
-    if slacknum > 0:
-        Fnew = np.hstack([Fnew, np.zeros((Fnew.shape[0], slacknum))])
-        # 若需要对某些行添加 +slack_i，请在此处逐行置 1（略）
-        # 追加 slack >= 0
-        F_slack_pos = np.hstack([np.zeros((slacknum, Hnew.shape[0])), np.eye(slacknum)])
-        Fnew = np.vstack([Fnew, F_slack_pos])
-        gnew = np.hstack([gnew, np.zeros(slacknum)])
+    Fnew = np.vstack([F_state, F_ctrl])      # 行数 = 18*(N+1) + 6N
+    gnew = np.hstack([g_state, g_ctrl])
 
     # =========== 等式约束（整段动力学） ============
+    # 先构建 xr_stack，ESDF 坐标系平移转换需要用到
     xr_stack = xr
     for ii in range(Controller.N):
         xr_stack = np.hstack([xr_stack, xr])
@@ -467,8 +440,62 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
         np.eye((Controller.N + 1) * Controller.n),
         -Controller.BU
     ])
+
+    # =========== ESDF 避障不等式约束 ============
+    F_esdf = None
+    if getattr(Controller, "esdf_adapter", None) is not None:
+        if hasattr(Controller.esdf_adapter, "refresh"):
+            Controller.esdf_adapter.refresh()
+
+        # Warm-start：使用上一拍预测轨迹(futureState)作为泰勒展开点，第0步用当前物理位置
+        positions = np.zeros((Controller.N + 1, 3))
+        positions[0] = [actualState[agent_index][0], actualState[agent_index][3], actualState[agent_index][6]]
+        for t in range(1, Controller.N + 1):
+            fs = getattr(agent, "futureState", None)
+            if fs is not None and len(fs) >= Controller.N * Controller.n:
+                if len(fs) == (Controller.N + 1) * Controller.n:
+                    base = t * Controller.n
+                else:
+                    base = (t - 1) * Controller.n
+                positions[t] = [fs[base + 0], fs[base + 3], fs[base + 6]]
+            else:
+                positions[t] = agent.rp[min(t + k, agent.rp.shape[0] - 1)]
+
+        d_safe = getattr(Controller, "esdf_d_safe", 0.3)
+        F_esdf_raw, g_esdf_raw = compute_esdf_inequality_constraints(
+            positions, d_safe, Controller.esdf_adapter,
+            n_state=Controller.n, n_control=Controller.m, n_horizon=Controller.N,
+        )
+
+        if F_esdf_raw.shape[0] > 0:
+            F_esdf = F_esdf_raw
+            # 致命 Bug 修复：QP 决策变量 z 为跟踪误差 e=X-X_ref，ESDF 约束基于绝对坐标 X。
+            # 物理约束 F*X<=g 须转为误差约束 F*e<=g - F*X_ref
+            g_esdf = g_esdf_raw - F_esdf[:, :(Controller.N + 1) * Controller.n] @ xr_stack
+
+    # =========== 松弛变量（软约束）处理 ============
+    slacknum = F_esdf.shape[0] if F_esdf is not None else 0
+    penalty_weight = getattr(Controller, "penalty", 10.0) * 500.0
+    Hnew = block_diag(Controller.H, np.eye(slacknum) * penalty_weight)
+
     if slacknum > 0:
-        A_eq = np.hstack([A_eq, np.zeros(((Controller.N + 1) * Controller.n, slacknum))])
+        # 1. 基础状态/控制约束右侧补零
+        Fnew = np.hstack([Fnew, np.zeros((Fnew.shape[0], slacknum))])
+
+        # 2. 避障约束允许突破，受 slack 惩罚：-∇d^T e - slack <= g_esdf
+        F_esdf_slack = np.hstack([F_esdf, -np.eye(slacknum)])
+        Fnew = np.vstack([Fnew, F_esdf_slack])
+        gnew = np.hstack([gnew, g_esdf])
+
+        # 3. slack >= 0：-slack <= 0
+        F_slack_pos = np.hstack([np.zeros((slacknum, Controller.H.shape[0])), -np.eye(slacknum)])
+        Fnew = np.vstack([Fnew, F_slack_pos])
+        gnew = np.hstack([gnew, np.zeros(slacknum)])
+
+        # 4. 等式约束补零对齐
+        A_eq = np.hstack([A_eq, np.zeros((A_eq.shape[0], slacknum))])
+    else:
+        Hnew = Controller.H
 
     # =========== 建立并求解 QP ============
     problem = Problem(

@@ -35,7 +35,7 @@ def _mpc_control_setup(context, *args, **kwargs):
     esdf_shm_name = LaunchConfiguration("esdf_shm_name", default="/fiesta_esdf").perform(context)
     esdf_grid_topic = LaunchConfiguration("esdf_grid_topic", default="/esdf/grid_full").perform(context)
     esdf_frame_id = LaunchConfiguration("esdf_frame_id", default="map_origin").perform(context)
-    esdf_d_safe = LaunchConfiguration("esdf_d_safe", default="0.3").perform(context)
+    esdf_d_safe = LaunchConfiguration("esdf_d_safe", default="1").perform(context)
     robot_names = _parse_robot_names(robots_raw)
 
     params = {

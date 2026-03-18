@@ -456,6 +456,23 @@ class EsdfShmAdapter:
         """主动刷新共享内存内容（规划前调用以获取最新 ESDF）。"""
         return self._refresh()
 
+    def query_trilinear_mpc(self, x: float, y: float, z: float) -> tuple[float, np.ndarray]:
+        """
+        供 MPC 控制专用的三线性插值，获取无人机位置的精确 ESDF 值与梯度。
+        采用显式权重形式。
+        """
+        if not self._ensure_ready() or self._grid is None:
+            return (5.0, np.zeros(3))
+        from .trilinear_esdf import query_esdf_trilinear
+        return query_esdf_trilinear(
+            self._grid,
+            tuple(self.origin),
+            float(self.resolution),
+            tuple(self.dims),
+            float(x), float(y), float(z),
+            has_gradient=True,
+        )
+
     def get_esdf(self, pos: Union[np.ndarray, list, tuple]) -> Union[float, np.ndarray]:
         pos = np.asarray(pos, dtype=float)
         if pos.ndim == 1:
