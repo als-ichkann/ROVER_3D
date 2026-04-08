@@ -1,7 +1,7 @@
 """
 ESDF 不等式约束接口，用于 MPC 避障。
 
-从 SHM 零拷贝读取 ESDF，采用三线性插值（参考 zhuanlan.zhihu.com/p/671385710）获取
+从 SHM 零拷贝读取 ESDF，采用三线性插值获取
 无人机位置的精确距离 d(p_ref) 与梯度 ∇d，基于一阶泰勒展开：
 
     d(p) ≈ d(p_ref) + ∇d^T (p - p_ref)

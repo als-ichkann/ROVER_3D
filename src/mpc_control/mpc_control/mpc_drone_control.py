@@ -11,8 +11,12 @@ import numpy as np
 import threading
 import rclpy
 from rclpy.node import Node
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_pose
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry, Path
+from rclpy.time import Time as RosTime
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
 
 class MPCDroneControlNode(Node):
@@ -56,6 +60,9 @@ class MPCDroneControlNode(Node):
         self._actual_state = np.zeros((1, 12))
         self._num_robots = 1
         self._esdf_adapter = None
+        self._state_frame_id = None  # 由 Odometry.header.frame_id 决定
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
         if self.get_parameter("use_esdf").value:
             try:
                 from rover3d_navigation.esdf_adapter import EsdfShmAdapter
@@ -113,6 +120,8 @@ class MPCDroneControlNode(Node):
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         yaw = self._quat_to_yaw(q)
+        if self._state_frame_id is None and getattr(msg.header, "frame_id", ""):
+            self._state_frame_id = msg.header.frame_id
         with self._lock:
             self._state[0] = p.x
             self._state[3] = p.y
@@ -127,10 +136,42 @@ class MPCDroneControlNode(Node):
         if len(msg.poses) < 2:
             self.get_logger().warn("Trajectory has fewer than 2 poses, ignored")
             return
-        pts = np.array([
-            [p.pose.position.x, p.pose.position.y, p.pose.position.z]
-            for p in msg.poses
-        ])
+
+        # 轨迹帧对齐：把 Path 里的点从各自 frame_id 变换到 MPC 当前使用的 state 坐标系。
+        # 若尚未收到 Odometry.header.frame_id，则退回直接使用 msg 里的数值。
+        target_frame = self._state_frame_id
+        if not target_frame:
+            pts = np.array([[p.pose.position.x, p.pose.position.y, p.pose.position.z] for p in msg.poses], dtype=float)
+        else:
+            # tf2 对于 stamp=0 通常可解释为“取最新”，失败则直接使用原点（并报 warning）。
+            stamp = getattr(msg.header, "stamp", None)
+            tf_time = RosTime()  # 默认 latest
+            try:
+                if stamp is not None:
+                    tf_time = RosTime.from_msg(stamp)
+            except Exception:
+                tf_time = RosTime()
+
+            pts_list = []
+            for ps in msg.poses:
+                src_frame = getattr(ps.header, "frame_id", "")
+                if not src_frame or src_frame == target_frame:
+                    pts_list.append([ps.pose.position.x, ps.pose.position.y, ps.pose.position.z])
+                    continue
+                try:
+                    transform = self._tf_buffer.lookup_transform(
+                        target_frame, src_frame, tf_time, timeout_sec=0.1
+                    )
+                    ps_t = do_transform_pose(ps, transform)
+                    pts_list.append([ps_t.pose.position.x, ps_t.pose.position.y, ps_t.pose.position.z])
+                except Exception:
+                    # 变换失败：直接用原值，同时避免频繁刷屏
+                    pts_list.append([ps.pose.position.x, ps.pose.position.y, ps.pose.position.z])
+                    self.get_logger().warn(
+                        f"TF transform Path point failed: {src_frame} -> {target_frame}. Using raw points.",
+                    )
+            pts = np.asarray(pts_list, dtype=float)
+
         with self._lock:
             self._trajectory_points = pts
             self._new_trajectory_flag = True

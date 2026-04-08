@@ -103,7 +103,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "use_esdf",
-            default_value="false",
+            default_value="true",
             description="是否启用 ESDF 避障不等式约束（零拷贝：shm 或 grid_cache）",
         ),
         DeclareLaunchArgument(
@@ -113,7 +113,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "esdf_d_safe",
-            default_value="0.3",
+            default_value="1",
             description="ESDF 安全距离 [m]，机器人中心到障碍物表面的最小距离",
         ),
         OpaqueFunction(function=_mpc_control_setup),

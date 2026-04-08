@@ -4,220 +4,16 @@ import scipy.sparse
 from scipy.stats import norm
 try:
     from . import control_law_3D
+    from .cvar_esdf import CVaR_for_single_node_esdf
+    from .gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
 except ImportError:
     import control_law_3D
-#from scipy.optimize import linprog
-#from shapely.geometry import Polygon, MultiPoint, LineString
+    from cvar_esdf import CVaR_for_single_node_esdf
+    from gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
 import math
-#from scipy.stats import multivariate_normal
 import pandas as pd
 import time
 from qpsolvers import solve_qp
-import networkx as nx
-#from trimesh.ray import ray_pyembree
-#import trimesh
-# ESDF: use esdf_map parameter (EsdfMapAdapter) with get_esdf, compute_gradient, is_collision_line_segment, resolution
-
-
-def _find_mean_index(means_list, mean):
-    """容差匹配：在 means_list 中查找与 mean 最接近的索引，避免 list.index 的浮点精度问题。"""
-    arr = np.asarray(mean).flatten()[:3]
-    for i, m in enumerate(means_list):
-        if np.allclose(np.asarray(m).flatten()[:3], arr):
-            return i
-    raise ValueError(f"Mean {list(arr)} not found in means_list (len={len(means_list)})")
-
-
-def shortest_path(Graph):
-    all_pairs_shortest_path = dict(nx.all_pairs_dijkstra_path(Graph), weight='weight')                   #计算所有节点对的最短路径
-    all_pairs_shortest_path_length = dict(nx.all_pairs_dijkstra_path_length(Graph), weight='weight')     #计算所有节点对的最短路径长度
-    path_existence = {}     
-    path_lengths = {}
-    for node in Graph.nodes():
-        path_existence[node] = {}
-        path_lengths[node] = {}
-        for target in Graph.nodes():
-            if node != target:
-                if target in all_pairs_shortest_path[node]:
-                    path = all_pairs_shortest_path[node][target]
-                    weighted_length = sum(Graph[u][v]['weight'] for u, v in zip(path[:-1], path[1:]))
-                    path_lengths[node][target] = weighted_length
-                    path_existence[node][target] = True
-                else:
-                    path_lengths[node][target] = float('nan')
-                    path_existence[node][target] = False
-            else:
-                path_lengths[node][target] = 0
-                path_existence[node][target] = True
-    return path_existence, path_lengths
-
-# def check_3d_line_obstacle(start_point, end_point, obstacles):
-#     """
-#     三维线段与多面体障碍物碰撞检测
-#     :param start_point: 线段起点 [x, y, z]
-#     :param end_point: 线段终点 [x, y, z]
-#     :param obstacles: 障碍物列表，每个元素为trimesh.Trimesh对象
-#     :return: 是否碰撞 (True/False)
-#     """
-#     # create direction vector
-#     direction = np.array(end_point) - np.array(start_point)
-#     norm = np.linalg.norm(direction)
-#     if norm < 1e-6:  # 零长度线段
-#         return False
-    
-#     # 转换为trimesh射线格式
-#     ray_origins = np.array([start_point])
-#     ray_directions = np.array([direction / norm])  # 单位化
-    
-#     # 遍历所有障碍物
-#     for obstacle in obstacles:
-#         # 获取障碍物的边界表示
-#         mesh = obstacle
-        
-#         # 进行射线相交检测
-#         intersector = ray_pyembree.RayMeshIntersector(mesh)
-#         locations, _, _ = intersector.intersects_location(
-#             ray_origins=ray_origins,
-#             ray_directions=ray_directions)
-        
-#         # 检查交点是否在线段范围内
-#         if len(locations) > 0:
-#             for loc in locations:
-#                 # 计算参数t (0 <= t <= 1)
-#                 vec = loc - start_point
-#                 t = np.dot(vec, direction) / np.dot(direction, direction)
-#                 if 0 <= t <= 1:
-#                     return True
-                    
-#     return False
-def notgreedy_genPathTable(current_means, current_covs, current_weights, fmeans, fcovs, fweights, conbinedmeans_list,
-                           conbinedcovs_list, esdf_map , Graph_GC, Wasserstein_table):
-    
-    LinearConnectFlag = 1
-    delDist = 0.05
-    W_tf = 3
-    NodePairTable = []
-    '''
-    for i in range(len(current_means)):
-        current_mu = current_means[i]                                     # 当前GMM的各高斯组分的均值
-        current_sigma = current_covs[i]                                   # 当前GMM的各高斯组分的方差
-        current_mu_i = _find_mean_index(conbinedmeans_list, current_mu)               # 当前GMM的各高斯组分对应总的离散化节点列表索引
-        for n in range(len(conbinedmeans_list)):
-            node_mu = conbinedmeans_list[n]                               # 遍历离散化节点列表的每个节点      
-            node_sigma = conbinedcovs_list[n]
-            d = Wasserstein_table[current_mu_i, n]                        # 读取wasserstein_table中一对索引之间的ws距离
-            if d >= np.sqrt(0) and d <= np.sqrt(4):                       # 筛选出ws距离满足大于0小于4的节点
-                LinearConnectFlag = 1
-                point1 = ([current_mu[0],current_mu[1],current_mu[2]])
-                point2 = ([node_mu[0], node_mu[1], node_mu[2]])
-                if esdf_map.is_collision_line_segment(point1, point2):
-                    LinearConnectFlag = 0                                 # 如果两个坐标相连与障碍物相交，说明这条直连路径不可行，LinearConnectFlag=0
-                if LinearConnectFlag == 1:
-                    if d < 1e-5:                                          # 如果距离很近，直接置为0
-                        Lagrangian = 0
-                    else:
-                        Dist_sq = math.ceil(d / delDist) * (delDist ** 2) # 否则，将距离用标准化单位delDist表示
-                        Lagrangian = Dist_sq 
-                    
-                    for m in range(len(conbinedmeans_list)):              # 遍历离散化节点列表
-                        node_mu_m = conbinedmeans_list[m] 
-                        node_sigma_m = conbinedcovs_list[m]
-                        d_nm = Wasserstein_table[n, m]
-                        if d_nm >= np.sqrt(0) and d_nm <= np.sqrt(4):
-                            LinearConnectFlag = 1
-                            # x1 = [node_mu_m[0], node_mu[0]]
-                            # y1 = [node_mu_m[1], node_mu[1]]
-                            point3 = np.clip([node_mu_m[0],node_mu_m[1],node_mu_m[2]])
-                            if esdf_map.is_collision_line_segment(point2, point3):
-                                LinearConnectFlag = 0
-                            if LinearConnectFlag == 1:
-                                if d_nm < 1e-5:
-                                    Lagrangian2 = 0
-                                else:
-                                    Lagrangian2 = math.ceil(d_nm / delDist) * (delDist ** 2)
-                                table_line = [i, n, m, 0, Lagrangian, Lagrangian2]             # 每条路径为从当前GMM的第i个组分出发，经过第n个节点，到达第m个节点
-                                table_lines = [table_line[:] for _ in range(len(fmeans))]      # 创建len（fmeans）条路径副本
-                                for ii in range(len(fmeans)): 
-                                    table_lines[ii][3] = ii                                    # 为每一个路径副本添加终点索引
-                                NodePairTable.extend(table_lines)                              # 将这些路径添加到总的路径表里面去
-                                '''
-    for i in range(len(current_means)):
-        current_mu = current_means[i]
-        current_sigma = current_covs[i]
-        current_mu_i = _find_mean_index(conbinedmeans_list, current_mu)
-        print(f"\n[Level 1] 当前GMM组分 i={i}, mu={current_mu}, index={current_mu_i}")
-        for n in range(len(conbinedmeans_list)):
-            node_mu = conbinedmeans_list[n]
-            node_sigma = conbinedcovs_list[n]
-            d = Wasserstein_table[current_mu_i, n]
-
-            if d >= np.sqrt(0) and d <= np.sqrt(4):
-                LinearConnectFlag = 1
-                point1 = [current_mu[0], current_mu[1], current_mu[2]]
-                point2 = [node_mu[0], node_mu[1], node_mu[2]]
-
-                if esdf_map.is_collision_line_segment(point1, point2):
-                    LinearConnectFlag = 0
-                if LinearConnectFlag == 1:
-                    if d < 1e-5:
-                        Lagrangian = 0
-                    else:
-                        Dist_sq = math.ceil(d / delDist) * (delDist ** 2)
-                        Lagrangian = Dist_sq
-
-                    for m in range(len(conbinedmeans_list)):
-                        node_mu_m = conbinedmeans_list[m]
-                        node_sigma_m = conbinedcovs_list[m]
-                        d_nm = Wasserstein_table[n, m]
-
-                        if d_nm >= np.sqrt(0) and d_nm <= np.sqrt(4):
-                            LinearConnectFlag = 1
-                            point3 = np.array([node_mu_m[0], node_mu_m[1], node_mu_m[2]])
-                            if esdf_map.is_collision_line_segment(point2, point3):
-                                LinearConnectFlag = 0
-
-                            if LinearConnectFlag == 1:
-                                if d_nm < 1e-5:
-                                    Lagrangian2 = 0
-                                else:
-                                    Lagrangian2 = math.ceil(d_nm / delDist) * (delDist ** 2)
-                                
-                                table_line = [i, n, m, 0, Lagrangian, Lagrangian2]
-                                table_lines = [table_line[:] for _ in range(len(fmeans))]
-                                for ii in range(len(fmeans)):
-                                    table_lines[ii][3] = ii
-                                NodePairTable.extend(table_lines)
-                                print(f"[Add] i={i}, n={n}, m={m}, d={d:.3f}, d_nm={d_nm:.3f}, "
-                                    f"L1={Lagrangian}, L2={Lagrangian2}, total added={len(NodePairTable)}")
-    path_table = np.zeros((len(NodePairTable), 8))                                             # 初始化八列的路径表
-    path_table[:, :6] = np.array(NodePairTable)                                                # 前六列添加原始数据
-    numPathTable = path_table.shape[0]                                                         # 路径总数为len（current_means)*(len(conbinedmean_list)^2)*len(fmeans)
-    subTable = path_table[:, 2:4]                                                              # 提取子表，第三、四列，即m和ii
-
-    df = pd.DataFrame(subTable)   
-    unique_df = df.drop_duplicates()                                                                            # 去重
-    unique_df_sorted = unique_df.sort_values(by=unique_df.columns.tolist()).reset_index(drop=True)              # 排序
-    PathTable_Unique = unique_df_sorted.to_numpy()                                                              # 转换为numpy数组
-    #unique_indices = unique_df_sorted.index
-    #subTable_df = pd.DataFrame(subTable)
-    #_, idx_Table = np.unique(subTable, axis=0, return_inverse=True)  # The result is temporarily incorrect but not important
-    idx_Table_Unique = np.array([np.where(np.all(PathTable_Unique == row, axis=1))[0][0] for row in subTable])  # 为原始路径数据中的每个节点对 (m, ii) 找到在唯一表 PathTable_Unique 中的索引。
-
-    numPathTable_Unique = PathTable_Unique.shape[0]
-    dist_n_j_Unique = np.zeros(numPathTable_Unique)
-    indexList_n = PathTable_Unique[:, 0]         
-    indexList_j = PathTable_Unique[:, 1]
-    all_pairs_shortest_path_length = Graph_GC
-    for m in range(numPathTable_Unique):
-        n = int(indexList_n[m])
-        j = int(indexList_j[m])
-        inner = all_pairs_shortest_path_length.get(n, {})
-        dist_n_j_Unique[m] = inner.get(j, float('nan'))  
-    dist_n_j = dist_n_j_Unique[idx_Table_Unique]      
-    path_table[:, 6] = dist_n_j                                                       #利用dijkstra算法求出最后一步有向图，从第n个节点到第j个终点均值位置的最短距离
-    path_table[:, 7] = path_table[:, 4] + path_table[:, 5] + W_tf * path_table[:, 6]  #算出这条路径的总距离，w_tf为常数
-    path_table = path_table[~np.isnan(dist_n_j), :]
-    return path_table
 
 
 def Optimization_SLP(current_means, current_covs, current_weights, fmeans, fcovs, fweights, conbinedmeans_list,
@@ -242,20 +38,19 @@ def Optimization_SLP(current_means, current_covs, current_weights, fmeans, fcovs
     print(current_weights)
     #将当前GMM的每个分量均值（mu[i]）与全局组合列表（combined_means_list）中的对应位置匹配
     for i in range(len(current_means)):
-        j = _find_mean_index(conbinedmeans_list, mu[i])
+        j = find_mean_index(conbinedmeans_list, mu[i])
         curr_GC_index.append(j)
     print("[1] 匹配 GC 索引完成")
-    # ESDF风险参数初始化（单障碍物模式）
-    v = np.array([esdf_map.get_esdf(conbinedmeans_list[idx]) for idx in curr_GC_index])  # 形状(numnode,)
-    Smu = v  # 均值参数，直接用一维数组即可
-
-    # 正确计算每个分量的方差参数
-    Ssig = np.array([
-        np.dot(
-            grad.T, np.dot(current_covs[i], grad)
-        ) if (grad := esdf_map.compute_gradient(conbinedmeans_list[curr_GC_index[i]])) is not None else 0
-        for i in range(len(current_means))
-    ])
+    # ESDF 风险参数初始化（模块化 CVaR_for_single_node_esdf）
+    Smu = np.zeros(len(current_means))
+    Ssig = np.zeros(len(current_means))
+    for i in range(len(current_means)):
+        mp, sp, _, _ = CVaR_for_single_node_esdf(
+            conbinedmeans_list[curr_GC_index[i]], current_covs[i], esdf_map, alpha
+        )
+        Smu[i] = mp
+        Ssig[i] = sp
+    v = Smu.copy()
     print("[2] 构建 Smu/Ssig 完成")
 
     '''
@@ -328,34 +123,31 @@ def Optimization_SLP(current_means, current_covs, current_weights, fmeans, fcovs
     num_k2_gc = len(index_k2_gc)
 
 
-    # ESDF风险参数提取
-    mean = np.array([esdf_map.get_esdf(conbinedmeans_list[idx]) for idx in index_next_gc])  # 修正拼写错误
-    meank2 = np.array([esdf_map.get_esdf(conbinedmeans_list[idx]) for idx in index_k2_gc])
-    
-    sigma = np.array([
-        (np.dot(grad.T, np.dot(conbinedcovs_list[idx], grad))  # 使用combinedcovs_list中的协方差矩阵
-         if (grad := esdf_map.compute_gradient(conbinedmeans_list[idx])) is not None 
-         else 0)
-        for idx in index_next_gc
-    ])
-    
-    sigmak2 = np.array([
-        (np.dot(grad.T, np.dot(conbinedcovs_list[idx], grad))  # 同上修正
-         if (grad := esdf_map.compute_gradient(conbinedmeans_list[idx])) is not None 
-         else 0)
-        for idx in index_k2_gc
-    ])
-    # 计算中间节点风险v 
-    z_score = norm.ppf(1 - alpha)  # 根据置信水平获取分位数
-    v = np.array([
-        mean[i] - z_score * np.sqrt(sigma[i])  # VaR计算：均值 - z分位数*标准差
-        for i in range(len(index_next_gc))
-    ])
-    # 计算目标节点风险vk2 
-    vk2 = np.array([
-        meank2[i] - z_score * np.sqrt(sigmak2[i]) 
-        for i in range(len(index_k2_gc))
-    ])
+    # ESDF 风险参数提取（模块化：投影均值/方差 + VaR）
+    mean = np.zeros(len(index_next_gc))
+    sigma = np.zeros(len(index_next_gc))
+    v = np.zeros(len(index_next_gc))
+    for i, idx in enumerate(index_next_gc):
+        mp, sp, VaR, _ = CVaR_for_single_node_esdf(
+            conbinedmeans_list[idx], conbinedcovs_list[idx], esdf_map, alpha
+        )
+        mean[i] = mp
+        sigma[i] = sp
+        v[i] = VaR
+
+    meank2 = np.zeros(len(index_k2_gc))
+    sigmak2 = np.zeros(len(index_k2_gc))
+    vk2 = np.zeros(len(index_k2_gc))
+    for i, idx in enumerate(index_k2_gc):
+        mp, sp, VaR, _ = CVaR_for_single_node_esdf(
+            conbinedmeans_list[idx], conbinedcovs_list[idx], esdf_map, alpha
+        )
+        meank2[i] = mp
+        sigmak2[i] = sp
+        vk2[i] = VaR
+
+    sigma_proj = sigma.copy()
+    sigma_proj_k2 = sigmak2.copy()
 
     numVariable = path_table.shape[0]           # 变量数 = 路径表行数
     f = path_table[:, 7]                        # 目标函数系数，即每条路径的总运输成本
@@ -378,7 +170,7 @@ def Optimization_SLP(current_means, current_covs, current_weights, fmeans, fcovs
         if iter == 0:                                   
             Path_curr = np.zeros(numVariable)               # 初始化路径光标数组，标记每条路径的当前节点索引
             for i in range(len(current_means)):
-                j = _find_mean_index(conbinedmeans_list, current_means[i])
+                j = find_mean_index(conbinedmeans_list, current_means[i])
                 Wa[j == index_next_gc] = weights[i]         # 那些当前步与中间步相重合的节点，其权重初始化为当前步权重
                 Wak2[j == index_k2_gc] = weights[i]         # 那些当前步与目标步相重合的节点，其权重初始化为当前步权重
                 indices = np.where(path_table[:, 0] == i)   # 找到所有以当前分量i为起点的路径
@@ -395,24 +187,8 @@ def Optimization_SLP(current_means, current_covs, current_weights, fmeans, fcovs
         else:
             Wa = Ws
             Wak2 = Wsk2
-        #-------ESDF风险参数计算-------
-        # 计算中间节点风险参数
-        sigma_proj = np.array([
-            np.dot(esdf_map.compute_gradient(conbinedmeans_list[idx]).T, 
-                np.dot(conbinedcovs_list[idx], 
-                        esdf_map.compute_gradient(conbinedmeans_list[idx])))
-            if esdf_map.compute_gradient(conbinedmeans_list[idx]) is not None else 0
-            for idx in index_next_gc
-        ])
-
-        # 计算目标节点风险参数 
-        sigma_proj_k2 = np.array([
-            np.dot(esdf_map.compute_gradient(conbinedmeans_list[idx]).T,
-                np.dot(conbinedcovs_list[idx],
-                        esdf_map.compute_gradient(conbinedmeans_list[idx])))
-            if esdf_map.compute_gradient(conbinedmeans_list[idx]) is not None else 0
-            for idx in index_k2_gc
-        ])
+        #-------ESDF风险参数（与路径表后预计算一致，避免重复查询）-------
+        # sigma_proj / sigma_proj_k2 在 SLP 循环外已由 CVaR_for_single_node_esdf 填充
 
         # 风险值迭代计算 
         def compute_risk_params(mean_vals, sigma_vals, weights, alpha, max_iter=100):
