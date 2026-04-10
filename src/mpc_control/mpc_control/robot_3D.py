@@ -8,6 +8,19 @@ from .Controller import controller
 from .esdf_constraint import compute_esdf_inequality_constraints
 
 
+def _as_vec3(row, fallback=None):
+    """将参考点行转为 (3,) float，避免空数组 (0,) 赋给 positions[t] 触发广播错误。"""
+    a = np.asarray(row, dtype=float).reshape(-1)
+    if a.size >= 3:
+        return a[:3].copy()
+    if a.size == 0 and fallback is not None:
+        return _as_vec3(fallback, None)
+    out = np.zeros(3)
+    if a.size > 0:
+        out[: a.size] = a
+    return out
+
+
 def get_3d_trajectories(current_points, points_list):
     """
     三维轨迹分割：从离当前点最近的位置截取后续轨迹。
@@ -65,10 +78,10 @@ class MPC_3D:
         self.m = 3  # number of control dimensions
         self.NT = 1000
         self.dt = dt
-        self.v_max = 0.3  # Maximum speed, simu: 0.3, real: 0.1
-        self.vz_max = 0.03
+        self.v_max = 0.75  # 水平最大速度 [m/s]（仿真可略高；真机请改小）
+        self.vz_max = 0.12  # 垂直最大速度 [m/s]
         self.w_max = np.pi / 4  # Maximum angular speed
-        self.a_max = 1
+        self.a_max = 2.0  # 加速度约束上限，与 v_max 提高配套
         self.jerk = 10
         self.penalty = 10
         self.controlFrequency = 1 / self.dt
@@ -435,6 +448,13 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
     xr_stack = xr
     for ii in range(Controller.N):
         xr_stack = np.hstack([xr_stack, xr])
+    xr_stack = np.asarray(xr_stack, dtype=float).reshape(-1)
+    nx_ref = (Controller.N + 1) * Controller.n
+    if xr_stack.size != nx_ref:
+        tmp = np.zeros(nx_ref, dtype=float)
+        ncpy = min(xr_stack.size, nx_ref)
+        tmp[:ncpy] = xr_stack[:ncpy]
+        xr_stack = tmp
     b_eq = Controller.AX @ xk - xr_stack
     A_eq = np.hstack([
         np.eye((Controller.N + 1) * Controller.n),
@@ -450,6 +470,8 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
         # Warm-start：使用上一拍预测轨迹(futureState)作为泰勒展开点，第0步用当前物理位置
         positions = np.zeros((Controller.N + 1, 3))
         positions[0] = [actualState[agent_index][0], actualState[agent_index][3], actualState[agent_index][6]]
+        rp_n = int(agent.rp.shape[0])
+        rp_idx_hi = max(0, rp_n - 1)
         for t in range(1, Controller.N + 1):
             fs = getattr(agent, "futureState", None)
             if fs is not None and len(fs) >= Controller.N * Controller.n:
@@ -457,9 +479,16 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
                     base = t * Controller.n
                 else:
                     base = (t - 1) * Controller.n
-                positions[t] = [fs[base + 0], fs[base + 3], fs[base + 6]]
+                positions[t] = _as_vec3(
+                    [fs[base + 0], fs[base + 3], fs[base + 6]],
+                    fallback=positions[0],
+                )
             else:
-                positions[t] = agent.rp[min(t + k, agent.rp.shape[0] - 1)]
+                if rp_n > 0:
+                    ri = min(t + k, rp_idx_hi)
+                    positions[t] = _as_vec3(agent.rp[ri], fallback=positions[0])
+                else:
+                    positions[t] = positions[0].copy()
 
         d_safe = getattr(Controller, "esdf_d_safe", 0.3)
         F_esdf_raw, g_esdf_raw = compute_esdf_inequality_constraints(
@@ -471,7 +500,7 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
             F_esdf = F_esdf_raw
             # 致命 Bug 修复：QP 决策变量 z 为跟踪误差 e=X-X_ref，ESDF 约束基于绝对坐标 X。
             # 物理约束 F*X<=g 须转为误差约束 F*e<=g - F*X_ref
-            g_esdf = g_esdf_raw - F_esdf[:, :(Controller.N + 1) * Controller.n] @ xr_stack
+            g_esdf = g_esdf_raw - F_esdf[:, :nx_ref] @ xr_stack
 
     # =========== 松弛变量（软约束）处理 ============
     slacknum = F_esdf.shape[0] if F_esdf is not None else 0
@@ -516,28 +545,38 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
         except Exception:
             continue
     z = solution.x if (solution is not None) else None
+    if z is not None:
+        z = np.asarray(z, dtype=float).reshape(-1)
+        if z.shape[0] != Hnew.shape[0]:
+            z = None
     Controller.timelist_qp[agent_index, k] = time.time() - qp_per_start_time
 
-    # 失败回退
-    if z is None or (hasattr(z, '__len__') and len(z) == 0):
-        if Controller.lastz is not None and (hasattr(Controller.lastz, '__len__') and len(Controller.lastz) > 0):
-            z = Controller.lastz
-            slacknum = Controller.lastslacknum
-        elif lastz is not None and (hasattr(lastz, '__len__') and len(lastz) > 0):
-            z, slacknum = lastz, lastslacknum
-            Controller.lastz = z
-            Controller.lastslacknum = slacknum
-        else:
-            # 无可用解：使用零控制
-            z = None
-        if z is None:
-            print(f'agent {agent_index} QP fail (no fallback)! pos={agent.position}, using zero control')
-            Controller.u[:, k] = np.zeros(Controller.m)
-            agent.velocity = [0.0, 0.0, 0.0]
-            agent.acceleration = [actualState[agent_index][2], actualState[agent_index][5], actualState[agent_index][8]]
-            agent.position = [actualState[agent_index][0], actualState[agent_index][3], actualState[agent_index][6]]
-            return actualState[agent_index], Controller.v[agent_index], Controller.w[agent_index], agent, Controller.lastz, Controller.lastslacknum
-    else:
+    nz_expected = int(Hnew.shape[0])
+    # 失败回退（解向量维数必须与当前 H 一致；否则 z[u_start:u_start+3] 可能为空触发广播错误）
+    need_fallback = z is None
+    if need_fallback:
+        if Controller.lastz is not None:
+            lz = np.asarray(Controller.lastz, dtype=float).reshape(-1)
+            if lz.shape[0] == nz_expected:
+                z = lz
+                slacknum = Controller.lastslacknum
+        if z is None and lastz is not None:
+            lz = np.asarray(lastz, dtype=float).reshape(-1)
+            if lz.shape[0] == nz_expected:
+                z = lz
+                slacknum = lastslacknum
+                Controller.lastz = z
+                Controller.lastslacknum = slacknum
+
+    if z is None:
+        print(f'agent {agent_index} QP fail (no fallback)! pos={agent.position}, using zero control')
+        Controller.u[:, k] = np.zeros(Controller.m)
+        agent.velocity = [0.0, 0.0, 0.0]
+        agent.acceleration = [actualState[agent_index][2], actualState[agent_index][5], actualState[agent_index][8]]
+        agent.position = [actualState[agent_index][0], actualState[agent_index][3], actualState[agent_index][6]]
+        return actualState[agent_index], Controller.v[agent_index], Controller.w[agent_index], agent, Controller.lastz, Controller.lastslacknum
+
+    if not need_fallback:
         Controller.lastz = z
         Controller.lastslacknum = slacknum
 
@@ -546,10 +585,16 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
     Controller.u[:, k] = z[u_start:u_start + Controller.m]
 
     # === 写回/推进状态 ===
-    Controller.z_of_agents[agent_index] = (
-        z[(Controller.N + 1) * Controller.n:] if slacknum == 0
-        else z[(Controller.N + 1) * Controller.n:(-1) * slacknum]
-    )
+    # 只取 N*m 维控制段；slacknum==0 时用 z[u_start:] 会把尾部 slack 误并进 U，
+    # 导致 z_of[m:] 维数≠ N*m-m，与 BU[:N*n, :N*m-m] 相乘报 matmul 22 vs 15。
+    nu = Controller.N * Controller.m
+    u_end = u_start + nu
+    if z.shape[0] < u_end:
+        Controller.z_of_agents[agent_index] = np.zeros(nu, dtype=float)
+    else:
+        Controller.z_of_agents[agent_index] = np.asarray(
+            z[u_start:u_end], dtype=float
+        ).reshape(-1)
 
     # 预测状态推进一拍：x_{k+1} = A x_k + B u_k
     Controller.x_of_agent[agent_index][:, k + 1] = (

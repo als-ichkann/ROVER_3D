@@ -16,7 +16,7 @@ from rover3d_navigation.esdf_adapter import EsdfMapAdapter, EsdfGridCache, EsdfS
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 
 class PlanningAPFNode(Node):
@@ -49,7 +49,6 @@ class PlanningAPFNode(Node):
         self.declare_parameter("map_size_y", 17.0)
         self.declare_parameter("map_size_z", 6.0)
         self.declare_parameter("esdf_resolution", 0.15)
-        self.declare_parameter("grid_step", 2.0)
         self.declare_parameter("config_dir", "")
 
         robot_names = self.get_parameter("robot_names").value
@@ -77,6 +76,11 @@ class PlanningAPFNode(Node):
                 self._config_dir = ""
 
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        qos_gmm_goal = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
 
         self._odom_cache: Dict[str, Optional[Odometry]] = {
             name: None for name in self._robot_names
@@ -85,6 +89,7 @@ class PlanningAPFNode(Node):
         self._planning_process: Optional[PlanningAPFProcess] = None
         self._log_no_odom_done = False
         self._log_no_traj_done = False
+        self._log_no_config_dir_done = False
         self._last_traj_log_time = 0.0
         self._first_publish_done = False
 
@@ -95,7 +100,9 @@ class PlanningAPFNode(Node):
                 lambda msg, n=name: self._cb_odom(n, msg),
                 qos,
             )
-        self.create_subscription(GMM, self._goal_topic, self._cb_gmm, 10)
+        self.create_subscription(
+            GMM, self._goal_topic, self._cb_gmm, qos_gmm_goal
+        )
 
         self._path_pubs: Dict[str, object] = {}
         for name in self._robot_names:
@@ -214,6 +221,15 @@ class PlanningAPFNode(Node):
             return
 
         if self._planning_process is None:
+            if not self._config_dir:
+                if not self._log_no_config_dir_done:
+                    self.get_logger().error(
+                        "无法创建 PlanningAPFProcess：缺少 config_dir（且无法解析包内 config）。"
+                        "请设置参数 config_dir 为含 GC_means_3D.json 等预计算文件的目录，"
+                        "或运行 scripts/precompute_config_prior.py 生成后指向该目录。"
+                    )
+                    self._log_no_config_dir_done = True
+                return
             self.get_logger().info(
                 "Creating PlanningAPFProcess"
             )
@@ -223,7 +239,6 @@ class PlanningAPFNode(Node):
             xb = xa + float(self.get_parameter("map_size_x").value)
             yb = ya + float(self.get_parameter("map_size_y").value)
             zb = za + float(self.get_parameter("map_size_z").value)
-            grid_step = float(self.get_parameter("grid_step").value)
             self._planning_process = PlanningAPFProcess(
                 num_robots=len(self._robot_names),
                 esdf_map=self._esdf,
@@ -239,8 +254,7 @@ class PlanningAPFNode(Node):
                 gmm_interp_steps=self._gmm_interp_steps,
                 max_apf_try=self._max_apf_try,
                 use_gmm_trajectory_slp=self._use_gmm_trajectory_slp,
-                grid_step=grid_step,
-                config_dir=self._config_dir if self._config_dir else None,
+                config_dir=self._config_dir,
             )
 
         try:

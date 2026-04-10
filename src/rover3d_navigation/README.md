@@ -4,7 +4,7 @@ This package hosts a lightweight per-robot navigation controller (`rover3d_navig
 
 ## 目录结构
 
-- `src/` — 节点入口（navigator.py, planning_apf_node.py, gmm_goal_publisher_node.py）
+- `src/` — 节点入口（navigator.py, planning_apf_node.py）；GMM 目标用 `scripts/publish_gmm_goal.py` 手动发布
 - `include/rover3d_navigation/` — 库代码（ROVER_3D, control_law_3D, Planning_3D, esdf_adapter, init_Graph_CVaR_3D, init_scene_3D, CVaR_SDF_constraint_3D）
 - `config/` — 配置文件
 - `launch/` — Launch 文件
@@ -45,11 +45,9 @@ Key entries:
 
 ### GMM 目标发布节点（可选）
 
-`gmm_goal_publisher_node` 用于测试：按参数发布 GMM 到 `apf_goal`。
+`publish_gmm_goal.py`：读取 `config/gmm_goal_publisher.yaml`，向 `apf_goal` 发布一条 GMM 后退出。
 
-- **参数**：`config/gmm_goal_publisher.yaml` 中配置 `means`、`covariances`、`weights`、`publish_rate`
-- **启动**：`ros2 run rover3d_navigation gmm_goal_publisher_node.py` 或 `use_gmm_publisher:=true` 随 launch 启动
-- **服务**：`/publish_gmm_goal`（std_srvs/Trigger）可触发单次发布
+- **用法**：`ros2 run rover3d_navigation publish_gmm_goal.py` 或 `--config /path/to.yaml`
 
 ### Planning APF Topics
 
@@ -78,7 +76,8 @@ ros2 launch rover3d_navigation planning_apf.launch.py use_esdf:=false use_mpc:=f
 ros2 launch rover3d_navigation planning_apf.launch.py robots:=bot1,bot2 use_esdf:=true
 
 # 附带 GMM 目标发布（用于无外部目标源时的测试）
-ros2 launch rover3d_navigation planning_apf.launch.py use_gmm_publisher:=true
+ros2 launch rover3d_navigation planning_apf.launch.py
+ros2 run rover3d_navigation publish_gmm_goal.py
 ```
 
 Requires: `navigation_msgs`, `esdf_map`, `python3-numpy`, `python3-scipy`, `python3-sklearn`.

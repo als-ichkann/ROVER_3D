@@ -115,6 +115,17 @@ class MPCDroneControlNode(Node):
         v_body_z = v_world[2]  # Z 轴不受 yaw 影响
         return np.array([v_body_x, v_body_y, v_body_z])
 
+    def _apply_min_speed_horizontal(self, v_world: np.ndarray) -> np.ndarray:
+        """
+        只对水平速度施加最小模长，避免「全矢量 min_speed」把微小的负 vz 放大成强下坠指令。
+        """
+        v = np.asarray(v_world, dtype=float).reshape(3).copy()
+        xy = v[:2]
+        n_xy = float(np.linalg.norm(xy))
+        if n_xy > 1e-9 and n_xy < self._min_speed:
+            v[:2] = xy / n_xy * self._min_speed
+        return v
+
     def _odom_cb(self, msg):
         """从 Odometry 更新 state。TF 来源的 Odom 不含线速度，故只更新位置和 yaw，不读假速度。"""
         p = msg.pose.pose.position
@@ -262,12 +273,13 @@ class MPCDroneControlNode(Node):
             # 轨迹已完成（MPC 输出已是物理速度，直接信任）
             v = np.array(getattr(agent, "velocity", [0, 0, 0]), dtype=float)
             v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-            v_norm = np.linalg.norm(v)
-            if v_norm > 1e-9 and v_norm < self._min_speed:
-                v = v / v_norm * self._min_speed
+            v = self._apply_min_speed_horizontal(v)
             ov = np.nan_to_num(np.array(getattr(agent, "angular_velocity", [0, 0, 0])), nan=0.0, posinf=0.0, neginf=0.0)
             # 世界系 -> 机体系（MulticopterVelocityControl 期望机体系 cmd_vel）
             v_body = self._world_to_body_velocity(v, state[9])
+            v_body[0] *= self._velocity_scale
+            v_body[1] *= self._velocity_scale
+            # 垂向不乘 velocity_scale，减轻「水平加速 + 垂向误差」被同步放大导致的下坠
             twist = Twist()
             twist.linear.x = float(v_body[0])
             twist.linear.y = float(v_body[1])
@@ -304,21 +316,20 @@ class MPCDroneControlNode(Node):
             self._state = np.copy(actual_state[0])
             self._current_step += 1
 
-        # 发布 Twist：MPC 输出已是物理速度（v_max=0.3），直接信任；仅施加 min_speed 防卡死
+        # 发布 Twist：MPC 受 v_max 限制；min_speed 仅水平；velocity_scale 仅 x/y 机体系分量
         v = np.array(agent.velocity, dtype=float)
         if not np.isfinite(v).all():
             self.get_logger().warn_throttle(1.0, "MPC velocity contains NaN/inf, clamping to 0")
         v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-        v_norm = np.linalg.norm(v)
-        if v_norm > 1e-9 and v_norm < self._min_speed:
-            v = v / v_norm * self._min_speed
+        v = self._apply_min_speed_horizontal(v)
         ov = np.array(getattr(agent, "angular_velocity", [0.0, 0.0, 0.0]), dtype=float)
         if not np.isfinite(ov).all():
             self.get_logger().warn_throttle(1.0, "MPC angular_velocity contains NaN/inf, clamping to 0")
         ov = np.nan_to_num(ov, nan=0.0, posinf=0.0, neginf=0.0)
-        # 世界系 -> 机体系（MulticopterVelocityControl 期望机体系 cmd_vel）
         yaw = state[9]
         v_body = self._world_to_body_velocity(v, yaw)
+        v_body[0] *= self._velocity_scale
+        v_body[1] *= self._velocity_scale
         twist = Twist()
         twist.linear.x = float(v_body[0])
         twist.linear.y = float(v_body[1])

@@ -12,18 +12,9 @@ import time
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.stats import multivariate_normal
 
-# 依赖：init_Graph_CVaR_3D, init_scene_3D
-from rover3d_navigation import init_Graph_CVaR_3D
-from rover3d_navigation import init_scene_3D
-
-try:
-    from . import control_law_3D
-    from . import Planning_3D
-except ImportError:
-    import control_law_3D
-    import Planning_3D
+from . import control_law_3D
+from . import Planning_3D
 import networkx as nx
 
 
@@ -91,6 +82,61 @@ def _adj_to_graph(adj: np.ndarray, n: int) -> "nx.DiGraph":
     return G
 
 
+def _require_config_dir(config_dir: Optional[str]) -> str:
+    if not config_dir or not str(config_dir).strip():
+        raise ValueError(
+            "PlanningAPFProcess 需要非空 config_dir，目录中须包含预计算文件："
+            "GC_means_3D.json, GC_covs_3D.json, Wasserstein_table_3D.npy, "
+            "Node_PDF_table_3D.npy, Graph_GC_3D.npy（可用 scripts/precompute_config_prior.py 生成）"
+        )
+    return os.path.abspath(os.path.expanduser(str(config_dir).strip()))
+
+
+def _load_precomputed_tables(config_dir: str) -> Tuple[list, list, np.ndarray, np.ndarray, np.ndarray]:
+    """仅从磁盘加载 GC 与 Wasserstein / Node_PDF / Graph 邻接，不做运行时重算。"""
+    files = (
+        ("GC_means_3D.json", "json"),
+        ("GC_covs_3D.json", "json"),
+        ("Wasserstein_table_3D.npy", "npy"),
+        ("Node_PDF_table_3D.npy", "npy"),
+        ("Graph_GC_3D.npy", "npy"),
+    )
+    paths = [(name, os.path.join(config_dir, name), kind) for name, kind in files]
+    missing = [name for name, p, _ in paths if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError(
+            f"预计算文件缺失（目录 {config_dir!r}）：{', '.join(missing)}"
+        )
+    path_means = paths[0][1]
+    path_covs = paths[1][1]
+    with open(path_means, "r", encoding="utf-8") as f:
+        gc_means = json.load(f)
+    with open(path_covs, "r", encoding="utf-8") as f:
+        raw_covs = json.load(f)
+    gc_covs = [
+        np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+        for c in raw_covs
+    ]
+    num = len(gc_means)
+    if num == 0:
+        raise ValueError("GC_means_3D.json 为空，至少需要 1 个 GC 节点")
+    if len(gc_covs) != num:
+        raise ValueError(
+            f"GC_covs 条数 ({len(gc_covs)}) 与 GC_means ({num}) 不一致"
+        )
+    w = np.load(paths[2][1])
+    pdf = np.load(paths[3][1])
+    graph_adj = np.load(paths[4][1])
+    exp = (num, num)
+    if tuple(w.shape) != exp or tuple(pdf.shape) != exp:
+        raise ValueError(
+            f"Wasserstein / Node_PDF 形状须为 {exp}，实际 W={w.shape}, PDF={pdf.shape}"
+        )
+    if tuple(graph_adj.shape) != exp:
+        raise ValueError(f"Graph_GC_3D 形状须为 {exp}，实际 {graph_adj.shape}")
+    return gc_means, gc_covs, w, pdf, graph_adj
+
+
 class PlanningAPFProcess:
     """
     ROS2 兼容规划进程：单步式 run_one_cycle 接口。
@@ -113,7 +159,6 @@ class PlanningAPFProcess:
         gmm_interp_steps: int = 5,
         max_apf_try: int = 10,
         use_gmm_trajectory_slp: bool = True,
-        grid_step: float = 2.0,
         config_dir: Optional[str] = None,
     ):
         self.num_robots = num_robots
@@ -126,33 +171,10 @@ class PlanningAPFProcess:
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
         self.alpha = 0.05
 
-        # 优先从 config 加载预计算的高斯节点与权重表
-        loaded_from_config = False
-        if config_dir:
-            path_means = os.path.join(config_dir, "GC_means_3D.json")
-            path_covs = os.path.join(config_dir, "GC_covs_3D.json")
-            if os.path.exists(path_means) and os.path.exists(path_covs):
-                with open(path_means, "r") as f:
-                    self.GC_means = json.load(f)
-                with open(path_covs, "r") as f:
-                    raw_covs = json.load(f)
-                self.GC_covs = [
-                    np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
-                    for c in raw_covs
-                ]
-                loaded_from_config = True
-
-        if not loaded_from_config:
-            # 基于地图边界构建高斯节点，grid_step 越大节点越少、初始化越快
-            step = float(grid_step)
-            mean_table = []
-            for i in np.arange(xa, xb, step):
-                for j in np.arange(ya, yb, step):
-                    for k in np.arange(za, zb, step):
-                        mean_table.append([float(i + 0.5), float(j + 0.5), float(k + 0.5)])
-            if len(mean_table) == 0:
-                mean_table = [[(xa + xb) / 2, (ya + yb) / 2, (za + zb) / 2]]
-            self.GC_means, self.GC_covs = init_Graph_CVaR_3D.init_GC_Nodes(mean_table)
+        cfg = _require_config_dir(config_dir)
+        gc_means, gc_covs, w_load, pdf_load, graph_load = _load_precomputed_tables(cfg)
+        self.GC_means = gc_means
+        self.GC_covs = gc_covs
 
         # 发布的目标点自动归并到最近的离散 GC 节点
         self.fmeans, self.fcovs, self.fweights = _map_goals_to_nearest_gc(
@@ -166,37 +188,11 @@ class PlanningAPFProcess:
         ]
         Numnode = len(self.conbinedmeans_list)
 
-        # Wasserstein 与 Node_PDF 表：优先从 config 加载
-        path_w = os.path.join(config_dir or "", "Wasserstein_table_3D.npy")
-        path_pdf = os.path.join(config_dir or "", "Node_PDF_table_3D.npy")
-        if not os.path.exists(path_w):
-            path_w = os.path.join(config_dir or "", "Wasserstein_table_3D.npy")
-        if not os.path.exists(path_pdf):
-            path_pdf = os.path.join(config_dir or "", "Node_PDF_table_3D.npy")
-        if config_dir and os.path.exists(path_w) and os.path.exists(path_pdf):
-            w_load = np.load(path_w)
-            pdf_load = np.load(path_pdf)
-            if w_load.shape == (Numnode, Numnode) and pdf_load.shape == (Numnode, Numnode):
-                self.Wasserstein_table = w_load
-                self.Node_PDF_table = pdf_load
-            else:
-                # 维度不匹配，重新计算
-                self._compute_wasserstein_pdf_tables(Numnode)
-        else:
-            self._compute_wasserstein_pdf_tables(Numnode)
-
-        # Graph_GC (最短路径长度矩阵)：优先从 config 加载
-        path_graph = os.path.join(config_dir or "", "Graph_GC_3D.npy")
-        if config_dir and os.path.exists(path_graph):
-            graph_load = np.load(path_graph)
-            if graph_load.shape == (Numnode, Numnode):
-                _, self.Graph_GC = Planning_3D.shortest_path(
-                    _adj_to_graph(graph_load, Numnode)
-                )
-            else:
-                self._build_graph_gc(Numnode)
-        else:
-            self._build_graph_gc(Numnode)
+        self.Wasserstein_table = w_load
+        self.Node_PDF_table = pdf_load
+        _, self.Graph_GC = Planning_3D.shortest_path(
+            _adj_to_graph(graph_load, Numnode)
+        )
 
         # 当前分布：从初始机器人位置估计
         self.current_means = list(self.fmeans)
@@ -211,35 +207,6 @@ class PlanningAPFProcess:
         self.step = 0
         self.robots_positions_expected: Optional[np.ndarray] = None
         self.stop_flag = False
-
-    def _compute_wasserstein_pdf_tables(self, Numnode: int) -> None:
-        """计算 Wasserstein 与 Node_PDF 表。"""
-        self.Wasserstein_table = np.zeros((Numnode, Numnode))
-        self.Node_PDF_table = np.zeros((Numnode, Numnode))
-        for i in range(Numnode):
-            for j in range(Numnode):
-                m1 = self.conbinedmeans_list[i]
-                c1 = self.conbinedcovs_list[i] if hasattr(self.conbinedcovs_list[i], "shape") else np.array(self.conbinedcovs_list[i]).reshape(3, 3)
-                m2 = self.conbinedmeans_list[j]
-                c2 = self.conbinedcovs_list[j] if hasattr(self.conbinedcovs_list[j], "shape") else np.array(self.conbinedcovs_list[j]).reshape(3, 3)
-                self.Wasserstein_table[i, j] = control_law_3D.Wasserstein_distance(m1, c1, m2, c2)
-                self.Node_PDF_table[i, j] = multivariate_normal.pdf(m1, mean=np.array(m2), cov=c2)
-
-    def _build_graph_gc(self, Numnode: int) -> None:
-        """构建图并计算最短路径。"""
-        Graph_adj = init_Graph_CVaR_3D.init_Graph_GC(
-            self.conbinedmeans_list, self.conbinedcovs_list, self.Wasserstein_table,
-            xa=self.xa, ya=self.ya, za=self.za, xb=self.xb, yb=self.yb, zb=self.zb,
-        )
-        G = nx.DiGraph()
-        for i in range(Numnode):
-            G.add_node(i)
-        rows, cols = Graph_adj.shape
-        for i in range(rows):
-            for j in range(cols):
-                if Graph_adj[i, j] != 0:
-                    G.add_edge(i, j, weight=Graph_adj[i, j])
-        _, self.Graph_GC = Planning_3D.shortest_path(G)
 
     def _gmm_score_samples(self, means, covs, weights, points: np.ndarray) -> np.ndarray:
         """用 GMM 对点集计算 log 概率。"""
@@ -363,6 +330,10 @@ class PlanningAPFProcess:
         next_means = [list(m) for m in next_m]
         next_covs = [np.asarray(c).reshape(3, 3) if np.size(c) == 9 else c for c in next_c]
         next_weights = list(next_w)
+
+        # 每周期用实时 odom 作为 APF 起点。若沿用上一拍 APF 输出，多步开环会使
+        # 「等效位置」漂移，吸引势相对虚点计算，易出现全体朝某一象限偏航（与目标均值无关）。
+        self.robots_positions_expected = np.array(robots_positions, copy=True)
 
         # APF 一步
         self.robots_positions_expected, robots_positions_list, _, _, _ = control_law_3D.APF(

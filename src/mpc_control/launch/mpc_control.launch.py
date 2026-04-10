@@ -27,15 +27,15 @@ def _parse_robot_names(raw: str) -> List[str]:
 
 def _mpc_control_setup(context, *args, **kwargs):
     robots_raw = LaunchConfiguration("robots").perform(context)
-    vel_scale = LaunchConfiguration("velocity_scale", default="1.0").perform(context)
-    min_speed = LaunchConfiguration("min_speed", default="0.15").perform(context)
+    vel_scale = LaunchConfiguration("velocity_scale", default="1.1").perform(context)
+    min_speed = LaunchConfiguration("min_speed", default="0.22").perform(context)
     odom_suffix = LaunchConfiguration("odom_suffix", default="global_odom").perform(context)
     use_esdf = LaunchConfiguration("use_esdf", default="false").perform(context)
     esdf_mode = LaunchConfiguration("esdf_mode", default="shm").perform(context)
     esdf_shm_name = LaunchConfiguration("esdf_shm_name", default="/fiesta_esdf").perform(context)
     esdf_grid_topic = LaunchConfiguration("esdf_grid_topic", default="/esdf/grid_full").perform(context)
     esdf_frame_id = LaunchConfiguration("esdf_frame_id", default="map_origin").perform(context)
-    esdf_d_safe = LaunchConfiguration("esdf_d_safe", default="1").perform(context)
+    esdf_d_safe = LaunchConfiguration("esdf_d_safe", default="0.3").perform(context)
     robot_names = _parse_robot_names(robots_raw)
 
     params = {
@@ -88,13 +88,13 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "velocity_scale",
-            default_value="1.0",
-            description="MPC 速度输出增益",
+            default_value="1.1",
+            description="在 MPC 线速度基础上再乘该系数（world→body 之后）",
         ),
         DeclareLaunchArgument(
             "min_speed",
-            default_value="0.15",
-            description="轨迹跟踪时的最小速度 (m/s)，避免输出过小无人机不动",
+            default_value="0.22",
+            description="水平面最小合速度 (m/s)；垂向 vz 不参与 min_speed，避免被放大成下坠",
         ),
         DeclareLaunchArgument(
             "odom_suffix",
@@ -113,7 +113,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "esdf_d_safe",
-            default_value="1",
+            default_value="0.3",
             description="ESDF 安全距离 [m]，机器人中心到障碍物表面的最小距离",
         ),
         OpaqueFunction(function=_mpc_control_setup),

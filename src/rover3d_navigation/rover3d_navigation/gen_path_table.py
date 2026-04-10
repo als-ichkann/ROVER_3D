@@ -1,8 +1,7 @@
-import math
+from typing import Dict, List, Tuple
 
 import networkx as nx
 import numpy as np
-import pandas as pd
 
 
 def _find_mean_index(means_list, mean):
@@ -42,6 +41,44 @@ def shortest_path(Graph):
     return path_existence, path_lengths
 
 
+def _seg_cache_key(p0, p1) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    a = tuple(np.round(np.asarray(p0, dtype=float).flatten()[:3], 4))
+    b = tuple(np.round(np.asarray(p1, dtype=float).flatten()[:3], 4))
+    return (a, b) if a <= b else (b, a)
+
+
+def _collision_cached(
+    cache: Dict[Tuple[Tuple[float, float, float], Tuple[float, float, float]], bool],
+    esdf_map,
+    p0,
+    p1,
+) -> bool:
+    k = _seg_cache_key(p0, p1)
+    if k not in cache:
+        q0 = [float(x) for x in np.asarray(p0, dtype=float).flatten()[:3]]
+        q1 = [float(x) for x in np.asarray(p1, dtype=float).flatten()[:3]]
+        cache[k] = bool(esdf_map.is_collision_line_segment(q0, q1))
+    return cache[k]
+
+
+def _sorted_neighbor_indices(
+    w_row: np.ndarray,
+    k: int,
+    max_dist: float,
+) -> List[int]:
+    """按 Wasserstein 距离升序取前 k 个且不超过 max_dist 的节点下标。"""
+    d = np.asarray(w_row, dtype=float).reshape(-1)
+    order = np.argsort(d, kind="mergesort")
+    out: List[int] = []
+    for j in order:
+        if len(out) >= k:
+            break
+        if d[int(j)] > max_dist:
+            break
+        out.append(int(j))
+    return out
+
+
 def notgreedy_genPathTable(
     current_means,
     current_covs,
@@ -54,81 +91,79 @@ def notgreedy_genPathTable(
     esdf_map,
     Graph_GC,
     Wasserstein_table,
+    *,
+    knn_k: int = 16,
+    max_wasserstein: float = 1.5,
+    w_tf: float = 3.0,
+    w2_cost_power: float = 2.0,
+    debug: bool = False,
 ):
-    LinearConnectFlag = 1
-    delDist = 0.05
-    W_tf = 3
-    NodePairTable = []
+    """
+    枚举 2-hop 路径 (current_i → n → m → target_j)，供 SLP/QP 使用。
+
+    Graph_GC: 全对最短路长度 dict，Graph_GC[u][v] 为标量（与 ROVER_3D 预计算一致）。
+    复杂度由全节点三重循环降为 O(|current| · K^2 · |fmeans|) 量级（K=knn_k）。
+
+    :param knn_k: 从当前 GC、从中间节点 n 各只保留 Wasserstein 意义下最近的 K 个邻居。
+    :param max_wasserstein: 两段 hop 允许的最大 Wasserstein 距离（与表中元素同量纲）。
+    :param w_tf: 图距离惩罚系数。
+    :param w2_cost_power: 段代价为 d**power；默认 2 即 d^2，比 ceil 离散化更光滑。
+    """
+    _ = current_covs, current_weights, fcovs, fweights, conbinedcovs_list
+
+    W = np.asarray(Wasserstein_table, dtype=float)
+    n_nodes = W.shape[0]
+    if W.shape[1] != n_nodes:
+        raise ValueError("Wasserstein_table 须为方阵")
+
+    collision_cache: Dict[Tuple[Tuple[float, float, float], Tuple[float, float, float]], bool] = {}
+    rows: List[List[float]] = []
+
     for i in range(len(current_means)):
         current_mu = current_means[i]
         current_mu_i = _find_mean_index(conbinedmeans_list, current_mu)
-        print(f"\n[Level 1] 当前GMM组分 i={i}, mu={current_mu}, index={current_mu_i}")
-        for n in range(len(conbinedmeans_list)):
+        if debug:
+            print(f"\n[gen_path] i={i}, current_gc={current_mu_i}, mu={current_mu}")
+
+        neighbors_n = _sorted_neighbor_indices(W[current_mu_i], knn_k, max_wasserstein)
+
+        for n in neighbors_n:
             node_mu = conbinedmeans_list[n]
-            d = Wasserstein_table[current_mu_i, n]
+            d = float(W[current_mu_i, n])
+            p_cur = np.asarray(current_mu, dtype=float).flatten()[:3]
+            p_n = np.asarray(node_mu, dtype=float).flatten()[:3]
+            if _collision_cached(collision_cache, esdf_map, p_cur, p_n):
+                continue
 
-            if d >= np.sqrt(0) and d <= np.sqrt(4):
-                LinearConnectFlag = 1
-                point1 = [current_mu[0], current_mu[1], current_mu[2]]
-                point2 = [node_mu[0], node_mu[1], node_mu[2]]
+            if d < 1e-8:
+                lag1 = 0.0
+            else:
+                lag1 = float(d ** w2_cost_power)
 
-                if esdf_map.is_collision_line_segment(point1, point2):
-                    LinearConnectFlag = 0
-                if LinearConnectFlag == 1:
-                    if d < 1e-5:
-                        Lagrangian = 0
-                    else:
-                        Dist_sq = math.ceil(d / delDist) * (delDist**2)
-                        Lagrangian = Dist_sq
+            neighbors_m = _sorted_neighbor_indices(W[n], knn_k, max_wasserstein)
 
-                    for m in range(len(conbinedmeans_list)):
-                        node_mu_m = conbinedmeans_list[m]
-                        d_nm = Wasserstein_table[n, m]
-                        if d_nm >= np.sqrt(0) and d_nm <= np.sqrt(4):
-                            LinearConnectFlag = 1
-                            point3 = np.array([node_mu_m[0], node_mu_m[1], node_mu_m[2]])
-                            if esdf_map.is_collision_line_segment(point2, point3):
-                                LinearConnectFlag = 0
+            for m in neighbors_m:
+                node_mu_m = conbinedmeans_list[m]
+                d_nm = float(W[n, m])
+                p_m = np.asarray(node_mu_m, dtype=float).flatten()[:3]
+                if _collision_cached(collision_cache, esdf_map, p_n, p_m):
+                    continue
 
-                            if LinearConnectFlag == 1:
-                                if d_nm < 1e-5:
-                                    Lagrangian2 = 0
-                                else:
-                                    Lagrangian2 = math.ceil(d_nm / delDist) * (delDist**2)
+                if d_nm < 1e-8:
+                    lag2 = 0.0
+                else:
+                    lag2 = float(d_nm ** w2_cost_power)
 
-                                table_line = [i, n, m, 0, Lagrangian, Lagrangian2]
-                                table_lines = [table_line[:] for _ in range(len(fmeans))]
-                                for ii in range(len(fmeans)):
-                                    table_lines[ii][3] = ii
-                                NodePairTable.extend(table_lines)
-                                print(
-                                    f"[Add] i={i}, n={n}, m={m}, d={d:.3f}, d_nm={d_nm:.3f}, "
-                                    f"L1={Lagrangian}, L2={Lagrangian2}, total added={len(NodePairTable)}"
-                                )
-    path_table = np.zeros((len(NodePairTable), 8))
-    path_table[:, :6] = np.array(NodePairTable)
-    subTable = path_table[:, 2:4]
+                inner = Graph_GC.get(n, {})
+                gdist = float(inner.get(m, float("nan")))
+                if gdist != gdist:  # NaN：图上不可达，不生成路径
+                    continue
 
-    df = pd.DataFrame(subTable)
-    unique_df = df.drop_duplicates()
-    unique_df_sorted = unique_df.sort_values(by=unique_df.columns.tolist()).reset_index(drop=True)
-    PathTable_Unique = unique_df_sorted.to_numpy()
-    idx_Table_Unique = np.array(
-        [np.where(np.all(PathTable_Unique == row, axis=1))[0][0] for row in subTable]
-    )
+                total = lag1 + lag2 + w_tf * gdist
+                for j in range(len(fmeans)):
+                    rows.append([i, n, m, j, lag1, lag2, gdist, total])
 
-    numPathTable_Unique = PathTable_Unique.shape[0]
-    dist_n_j_Unique = np.zeros(numPathTable_Unique)
-    indexList_n = PathTable_Unique[:, 0]
-    indexList_j = PathTable_Unique[:, 1]
-    all_pairs_shortest_path_length = Graph_GC
-    for m in range(numPathTable_Unique):
-        n = int(indexList_n[m])
-        j = int(indexList_j[m])
-        inner = all_pairs_shortest_path_length.get(n, {})
-        dist_n_j_Unique[m] = inner.get(j, float("nan"))
-    dist_n_j = dist_n_j_Unique[idx_Table_Unique]
-    path_table[:, 6] = dist_n_j
-    path_table[:, 7] = path_table[:, 4] + path_table[:, 5] + W_tf * path_table[:, 6]
-    path_table = path_table[~np.isnan(dist_n_j), :]
-    return path_table
+    if not rows:
+        return np.zeros((0, 8), dtype=float)
+
+    return np.asarray(rows, dtype=float)

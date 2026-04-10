@@ -2,14 +2,9 @@ import numpy as np
 import scipy.linalg
 import scipy.sparse
 from scipy.stats import norm
-try:
-    from . import control_law_3D
-    from .cvar_esdf import CVaR_for_single_node_esdf
-    from .gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
-except ImportError:
-    import control_law_3D
-    from cvar_esdf import CVaR_for_single_node_esdf
-    from gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
+from . import control_law_3D
+from .cvar_esdf import CVaR_for_single_node_esdf
+from .gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
 import math
 import pandas as pd
 import time

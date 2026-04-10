@@ -99,7 +99,7 @@ def main() -> None:
         "--grid-step",
         type=float,
         default=2.0,
-        help="GC 节点网格步长 [m]，与 planning_apf grid_step 一致",
+        help="GC 节点网格步长 [m]（须与生成 config 时所用步长一致）",
     )
     args = parser.parse_args()
 

@@ -20,6 +20,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
 
+  <depend>python3-yaml</depend>
   <depend>python3-numpy</depend>
   <depend>python3-pandas</depend>
   <depend>python3-networkx</depend>

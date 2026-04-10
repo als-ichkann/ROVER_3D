@@ -7,11 +7,13 @@ ESDF 建图、MPC 控制等由其他 launch 负责启动。
 
 使用方法:
   ros2 launch rover3d_navigation planning_apf.launch.py
-  ros2 launch rover3d_navigation planning_apf.launch.py robots:=bot1,bot2 use_gmm_publisher:=true
+  ros2 launch rover3d_navigation planning_apf.launch.py robots:=bot1,bot2
+
+GMM 目标需手动发布（与 config/gmm_goal_publisher.yaml 一致）:
+  ros2 run rover3d_navigation publish_gmm_goal.py
 
 逻辑:
-  1. use_gmm_publisher:=true 时启动 gmm_goal_publisher，发布 apf_goal (GMM)
-  2. planning_apf_node: 订阅 apf_goal、/{robot}/global_odom（Swarm-LIO2+map_fusion），订阅 /esdf/grid_full（FIESTA 发布的完整 ESDF 栅格）做 local 避障查询，
+  1. planning_apf_node: 订阅 apf_goal、/{robot}/global_odom（Swarm-LIO2+map_fusion），订阅 /esdf/grid_full（FIESTA 发布的完整 ESDF 栅格）做 local 避障查询，
      运行 SLP 宏观优化 + APF 势场，发布 /{robot}/apf_trajectory
      （use_esdf_grid_cache:=true 时订阅 topic；false 时改调用 esdf/query 服务）
 """
@@ -32,28 +34,9 @@ def _planning_apf_setup(context, *args, **kwargs):
     robots_raw = LaunchConfiguration("robots").perform(context)
     robot_names = _parse_robot_names(robots_raw)
     config_file = LaunchConfiguration("config_file")
-    use_gmm_publisher = LaunchConfiguration("use_gmm_publisher").perform(context)
-
     nodes = []
 
-    # 1. GMM 目标发布节点
-    if use_gmm_publisher.lower() == "true":
-        gmm_config = PathJoinSubstitution([
-            FindPackageShare("rover3d_navigation"),
-            "config",
-            "gmm_goal_publisher.yaml",
-        ]).perform(context)
-        nodes.append(
-            Node(
-                package="rover3d_navigation",
-                executable="gmm_goal_publisher_node.py",
-                name="gmm_goal_publisher",
-                output="screen",
-                parameters=[gmm_config],
-            )
-        )
-
-    # 2. Planning APF 节点
+    # Planning APF 节点（GMM 由 ros2 run rover3d_navigation publish_gmm_goal.py 手动发布）
     nodes.append(
         Node(
             package="rover3d_navigation",
@@ -85,11 +68,6 @@ def generate_launch_description() -> LaunchDescription:
                 "planning_apf.yaml",
             ]),
             description="YAML 配置文件，包含 planning_apf_node 参数",
-        ),
-        DeclareLaunchArgument(
-            "use_gmm_publisher",
-            default_value="false",
-            description="启动 GMM 目标发布节点，发布 apf_goal",
         ),
         OpaqueFunction(function=_planning_apf_setup),
     ])

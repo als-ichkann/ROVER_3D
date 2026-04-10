@@ -6,23 +6,35 @@ from scipy.linalg import sqrtm
 from scipy.stats import multivariate_normal
 from scipy.spatial.distance import cdist
 from scipy.optimize import linprog
-# from skimage.measure import find_contours
 from sklearn.mixture import GaussianMixture
-import warnings
 import time
-# import trimesh
-# ESDF: use esdf_map parameter (EsdfMapAdapter)
-# 依赖：init_scene_3D, CVaR_SDF_constraint_3D
-from rover3d_navigation.init_scene_3D import ObstacleManager
-from rover3d_navigation.CVaR_SDF_constraint_3D import (
-    sd_3d,
-    normal_vector_SDF_3d,
-    CVaR,
-)
+
 from shapely.geometry import LineString, Point
 from qpsolvers import solve_qp
 from shapely.geometry import Polygon as ShapelyPolygon
 
+# ---------------------------------------------------------------------------
+# APF 宏观调参：优先平滑飞向 GMM 目标，减弱机间/边界与吸引竞争导致的振荡、乱飞
+# ---------------------------------------------------------------------------
+# 吸引：协方差平滑越大，远处梯度越温和、易沿主方向飞向目标
+APF_SIGMA_K_DIAG = 0.45
+# 吸引梯度增益（相对原实现放大，避免被斥力“压过”）
+APF_ATTRACT_GAIN = 2.2
+# 机间斥力（高斯 + 反比距离）整体缩放；原 r_repulsion=0.16m 时多机极易互相弹开
+APF_AGENT_REPULSE_GAIN = 0.28
+# 障碍物 ESDF 斥力缩放（略低更易过窄缝；与下方「单位向量混合」一起用）
+APF_ESDF_REPULSE_GAIN = 0.32
+# FIESTA 的 grad 为 ∇d（距离增大方向、背离障碍）。步长 pos -= dU_unit*v 为下坡，
+# 障碍势能近障更高，∇U_obstacle ∝ −∇d，故 dU 中应加「−∇d」而非「+∇d」。
+# 斥力公式里 d 过小会数值爆炸，做下限；混合权重避免「全向量相加再归一」时斥力完全盖住目标方向。
+APF_ESDF_SAFE_DIST_MIN = 0.08
+APF_ATT_REP_UNIT_BLEND = 0.68
+# 地图边界斥力缩放（靠边时原力极易饱和引发抖动）
+APF_BOUNDARY_REPULSE_GAIN = 0.35
+# 机间势能在标量 U / U_next 中的权重；须与 U_next 一致，否则外层 APF 迭代不收敛、轨迹抖
+APF_GAMMA_INTER_AGENT = 0.22
+# 归一化方向后每子步最大位移（米）；外层 APF 会多次调用，略降基底可减过冲
+APF_MAX_VELOCITY_BASE = 0.78  # APF 子步位移上限 [m]，与 MPC v_max 提高配套
 
 
 def find_nonzero_elements(arr):
@@ -134,18 +146,18 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
     yb = ya + esdf_map.dims[1] * esdf_map.resolution
     zb = za + esdf_map.dims[2] * esdf_map.resolution
     # Robot motion constraints
-    max_Velocity = 0.5            
-    r_repulsion_sensor = 0.16           #Repulsion range between sensors
-    r_repulsion_obstacle = 0.16         #Repulsion range from obstacles
+    max_Velocity = APF_MAX_VELOCITY_BASE
+    r_repulsion_sensor = 0.35           # 机间开始明显斥力的距离 [m]，略增大使力变化更平滑
+    r_repulsion_obstacle = 0.28         # ESDF 斥力作用带 [m]
     dimW = int(3)
     numAgent = robots_positions.shape[0]   
     minDistance = 1e-8                  
-    gamma = 0.8                       # weight for interaction force
-    sigma_k = np.eye(dimW) * 0.1        # convariance matrix for smoothing, making GMM more robust to numerical errors
-    Rdiameter = 0.012                   # Robot diameter
-    Rradius = 0.5 * Rdiameter           # Robot radius
+    gamma = APF_GAMMA_INTER_AGENT
+    sigma_k = np.eye(dimW) * APF_SIGMA_K_DIAG
+    Rdiameter = 0.35                    # 机间安全等效直径 [m]（原 0.012 过小，斥力几乎始终极强）
+    Rradius = 0.5 * Rdiameter
     if MaxNumTry != 1:
-        max_Velocity = max_Velocity / MaxNumTry * 2.4
+        max_Velocity = max_Velocity / MaxNumTry * 2.0
     #numComponent = len(next_means)
     #dU = robots_positions.shape          
     #GM_gmm = np.zeros(robots_positions.shape[0])
@@ -167,7 +179,7 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         dU_sensor_gmm = dU_sensor_gmm + weight * np.hstack([GM_gmm[:, np.newaxis], GM_gmm[:, np.newaxis], GM_gmm[:, np.newaxis]]) * (
                 Diff_sensor_gmm @ np.linalg.inv(sigma))
         U_sensor_gmm = U_sensor_gmm + weight * GM_gmm
-    dU_sensor_gmm = (1 / numAgent) * dU_sensor_gmm
+    dU_sensor_gmm = (1 / numAgent) * dU_sensor_gmm * APF_ATTRACT_GAIN
     U_sensor_gmm = -np.mean(U_sensor_gmm)
 
     '''
@@ -184,7 +196,10 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
     GM_sensor_vector = np.expand_dims(multivariate_normal.pdf(Diff_sensor, mean=mu, cov=sigma), axis=1) # 算出每对机器人之间距离的在标准三维正态分布下的pdf值作为势能
     dU_sensor_vector = (GM_sensor_vector * (Diff_sensor @ np.linalg.inv(sigma))).flatten(order='F')     # 对高斯势场求梯度
     dU_sensor_matrix = dU_sensor_vector.reshape((dimW, numAgent, numAgent)).transpose(0, 2, 1)
-    dU_sensor = -np.sum(dU_sensor_matrix, axis=1).T / (numAgent**2)                                                                                                        
+    # 高斯机间势的梯度（仅进入标量 U 的 gamma 项；位移主方向见下式 dU 中的反比距离项）
+    dU_sensor = (
+        -np.sum(dU_sensor_matrix, axis=1).T / (numAgent**2) * APF_AGENT_REPULSE_GAIN
+    )
     U_sensor = 1 / 2 * np.mean(GM_sensor_vector)
 
     # compute repulsion force2 between agents(avoid collision)  method: using inverse distance to ensure a strict min distance
@@ -204,7 +219,7 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         dU_repulsion_sensor_vector[index_other_near, :] = dU_repulsion_sensor_other_near
     dU_repulsion_sensor_vector = dU_repulsion_sensor_vector.flatten(order='F')
     dU_repulsion_sensor_matrix = np.reshape(dU_repulsion_sensor_vector, (dimW, numAgent, numAgent)).transpose(0, 2, 1)
-    dU_repulsion_sensor = - np.sum(dU_repulsion_sensor_matrix, 2).T
+    dU_repulsion_sensor = -np.sum(dU_repulsion_sensor_matrix, 2).T * APF_AGENT_REPULSE_GAIN
 
 
     # dU_repulsion_obstacle
@@ -258,17 +273,17 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
     affected_agents = np.where(in_repulsion_zone)[0]
     
     if affected_agents.size > 0:
-        # 计算斥力强度系数
-        safe_dists = esdf_distances[affected_agents]
+        # 计算斥力强度系数（距离下限防 1/d^4 爆炸）
+        safe_dists = np.maximum(esdf_distances[affected_agents], APF_ESDF_SAFE_DIST_MIN)
         epsilon = 1e-10
         scale_factors = (1/(safe_dists + epsilon) - 1/r_repulsion_obstacle) / (safe_dists**3 + epsilon)
         
-        # 计算斥力向量
-        repulsion_vectors = scale_factors[:, np.newaxis] * esdf_gradients[affected_agents]
+        # 斥力沿 −∇d，使 −(dU 总和) 在障碍侧指向自由空间（与吸引项一致的下坡约定）
+        repulsion_vectors = -scale_factors[:, np.newaxis] * esdf_gradients[affected_agents]
         
         # 累加到总斥力矩阵
         np.add.at(dU_repulsion_sensor_obstacle, (affected_agents, slice(None)), repulsion_vectors)
-
+    dU_repulsion_sensor_obstacle *= APF_ESDF_REPULSE_GAIN
 
     # 边界斥力
     Dist_sensor_boundary_Left = robots_positions[:, 0] - xa + minDistance - Rradius
@@ -362,12 +377,38 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         # 对Back方向的力进行限幅
         dU_repulsion_Back = np.clip(dU_repulsion_Back, -force_limit, force_limit)
 
-    dU_repulsion_sensor_boundary = dU_repulsion_Left + dU_repulsion_Right + dU_repulsion_Top + dU_repulsion_Bottom + dU_repulsion_Front + dU_repulsion_Back
-    # calculate the total force
-    dU = dU_sensor_gmm + dU_repulsion_sensor + dU_repulsion_sensor_obstacle + dU_repulsion_sensor_boundary
-    dU_norm = np.sqrt(dU[:, 0] ** 2 + dU[:, 1] ** 2 + dU[:, 2] ** 2)
-    dU_norm = np.maximum(dU_norm, 1e-10)  # 避免零除
-    dU = dU / np.vstack((dU_norm, dU_norm, dU_norm)).T
+    dU_repulsion_sensor_boundary = (
+        dU_repulsion_Left
+        + dU_repulsion_Right
+        + dU_repulsion_Top
+        + dU_repulsion_Bottom
+        + dU_repulsion_Front
+        + dU_repulsion_Back
+    ) * APF_BOUNDARY_REPULSE_GAIN
+    # 合成方向：先分别单位化吸引与「各类斥力之和」，再混合。避免斥力模长远大于吸引时，
+    # 「矢量相加再归一」把目标方向几乎消掉 → 贴障滑移/局部极小/过不了中间有障碍的路径。
+    att = dU_sensor_gmm
+    rep = (
+        dU_repulsion_sensor
+        + dU_repulsion_sensor_obstacle
+        + dU_repulsion_sensor_boundary
+    )
+    att_n = np.linalg.norm(att, axis=1, keepdims=True)
+    rep_n = np.linalg.norm(rep, axis=1, keepdims=True)
+    att_u = np.divide(att, att_n, out=np.zeros_like(att), where=(att_n > 1e-10))
+    rep_u = np.divide(rep, rep_n, out=np.zeros_like(rep), where=(rep_n > 1e-10))
+    ba = float(APF_ATT_REP_UNIT_BLEND)
+    dU = ba * att_u + (1.0 - ba) * rep_u
+    comb_n = np.linalg.norm(dU, axis=1, keepdims=True)
+    dU = np.divide(dU, np.maximum(comb_n, 1e-10))
+    # 吸引与斥力近乎对顶时 comb≈0，优先保持指向目标的 att_u
+    oppose = comb_n.ravel() < 1e-8
+    if np.any(oppose):
+        for j in np.flatnonzero(oppose):
+            if att_n[j, 0] > 1e-10:
+                dU[j, :] = att_u[j, :]
+            elif rep_n[j, 0] > 1e-10:
+                dU[j, :] = rep_u[j, :]
     U = U_sensor_gmm + gamma * U_sensor
     # guarantee free from collision
     # guarantee free from collision
@@ -395,9 +436,26 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         indexSensor = np.where(dists <= 0)[0]
         k += 1
 
-    # 第 4 次仍然碰撞 → 干脆原地不动
+    # 第 4 次仍然碰撞 → 先退回原点，再试沿「纯吸引」方向极小步，减少卡死在障碍壳上
     if indexSensor.size > 0:
-        SensorPos_next[indexSensor] = robots_positions[indexSensor]
+        stuck = np.asarray(indexSensor, dtype=int).ravel()
+        SensorPos_next[stuck] = robots_positions[stuck]
+        for ii in stuck:
+            ga = dU_sensor_gmm[ii, :]
+            gn = float(np.linalg.norm(ga))
+            if gn < 1e-12:
+                continue
+            gu = ga / gn
+            for frac in (0.45, 0.28, 0.16, 0.09, 0.05):
+                trial = robots_positions[ii, :] - gu * (max_Velocity * frac)
+                d_try = esdf_map.get_esdf(trial)
+                if isinstance(d_try, np.ndarray):
+                    d_try = float(np.asarray(d_try).ravel()[0])
+                else:
+                    d_try = float(d_try)
+                if d_try > 0:
+                    SensorPos_next[ii, :] = trial
+                    break
 
     # ------------------------------------------------------------------
     # 4. 边界约束（修正 z 维下标写错的问题）
@@ -439,7 +497,7 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
     )
     U_sensor_next = 0.5 * np.mean(GM_sensor_next_vector)
 
-    U_next              = U_sensor_next_gmm + 0.5 * U_sensor_next
+    U_next = U_sensor_next_gmm + gamma * U_sensor_next
     J_rate              = U - U_next
     robots_positions_next = SensorPos_next
     # ------------------------------------------------------------------

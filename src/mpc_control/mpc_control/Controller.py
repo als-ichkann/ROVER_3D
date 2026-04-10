@@ -63,7 +63,7 @@ def controller(agent, u, n):
     theta_next = theta + omega_vec * dt
 
     # ===== 加速度限幅（逐分量）=====
-    a_vec_next = np.clip(a_vec_next, -0.99, 0.99)
+    a_vec_next = np.clip(a_vec_next, -2.0, 2.0)
 
     # ===== 组装 12 维状态向量 =====
     x = np.array([
