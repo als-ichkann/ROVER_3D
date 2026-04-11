@@ -92,8 +92,9 @@ def notgreedy_genPathTable(
     Graph_GC,
     Wasserstein_table,
     *,
-    knn_k: int = 16,
-    max_wasserstein: float = 1.5,
+    knn_k: int = 24,
+    # 与历史实现 d<=2（Wasserstein 距离上界）对齐；1.5 过严时 path_table 常为空 → SLP 回退、轨迹变短
+    max_wasserstein: float = 2.0,
     w_tf: float = 3.0,
     w2_cost_power: float = 2.0,
     debug: bool = False,

@@ -29,8 +29,9 @@ def controller(agent, u, n):
 
     # 速度/角速度限幅
     bound  = 3.0                   # 角速度上限（幅值）
-    vbound = 0.02                  # 最小线速度
-    vmax   = float(agent.vmax) * 0.99
+    vbound = 0.02                  # 最小水平线速度（仅 xy，避免把 vz 抬到最小模长引发上下抖）
+    vxymax = float(agent.vmax) * 0.99
+    vzmax = float(getattr(agent, "vzmax", agent.vmax)) * 0.99
 
     # ===== jerk 模型离散积分 =====
     # v_{k+1} = v_k + a_k dt + 0.5 * j dt^2
@@ -51,13 +52,17 @@ def controller(agent, u, n):
     #     omega_vec[2] = 1.0 * yaw_error
     omega_mag = float(np.linalg.norm(omega_vec))
 
-    # ===== 速度限幅（修复：真正修改速度向量，而非仅改标量 v_mag）=====
+    # ===== 速度限幅：xy 与 z 分离（与 MPC 中 vzmax 一致，避免 3D 模长用 vmax 压扁垂向）=====
+    v_xy = v_vec_next[:2].astype(float)
+    n_xy = float(np.linalg.norm(v_xy))
+    if n_xy > vxymax:
+        v_xy = v_xy / n_xy * vxymax
+    v_vec_next = np.array([v_xy[0], v_xy[1], v_vec_next[2]], dtype=float)
+    v_vec_next[2] = float(np.clip(v_vec_next[2], -vzmax, vzmax))
+    n_xy = float(np.linalg.norm(v_vec_next[:2]))
+    if n_xy > 1e-9 and n_xy < vbound:
+        v_vec_next[:2] = v_vec_next[:2] / n_xy * vbound
     v_mag = float(np.linalg.norm(v_vec_next))
-    if v_mag > 1e-9 and v_mag < vbound:
-        v_vec_next = v_vec_next / v_mag * vbound
-    elif v_mag > vmax:
-        v_vec_next = v_vec_next / v_mag * vmax
-    v_mag = float(np.linalg.norm(v_vec_next))  # 限幅后重新计算，供返回值使用
 
     # ===== 姿态更新（逐轴积分）=====
     theta_next = theta + omega_vec * dt

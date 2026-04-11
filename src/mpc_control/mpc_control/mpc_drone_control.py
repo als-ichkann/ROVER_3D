@@ -2,13 +2,14 @@
 """
 MPC Drone Control ROS2 Node
 
-订阅 global_odom（Swarm-LIO2 + map_fusion 全局定位）、trajectory (apf_trajectory)，
-执行 MPC 轨迹跟踪，发布 cmd_vel (Twist)。
-用于控制仿真中的无人机，运动接口符合 geometry_msgs/Twist。
+订阅 odom（默认 global_odom）和 trajectory (apf_trajectory)，发布 cmd_vel (Twist)。
+默认使用“基础控制模式”（P 速度跟踪 + 限速/限加速度）以适配 Gazebo 无人机速度控制插件。
+保留原 MPC 链路，可通过参数 simple_mode:=false 切换。
 """
 
 import numpy as np
 import threading
+from typing import Dict
 import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
@@ -27,8 +28,16 @@ class MPCDroneControlNode(Node):
         self.declare_parameter("control_dt", 0.1)
         self.declare_parameter("control_frequency", 10)
         self.declare_parameter("velocity_scale", 1.0)
-        self.declare_parameter("min_speed", 0.15)
+        self.declare_parameter("min_speed", 0.0)
         self.declare_parameter("odom_suffix", "global_odom")
+        self.declare_parameter("simple_mode", True)
+        self.declare_parameter("simple_kp_xy", 1.0)
+        self.declare_parameter("simple_kp_z", 1.2)
+        self.declare_parameter("simple_max_speed_xy", 0.9)
+        self.declare_parameter("simple_max_speed_z", 0.45)
+        self.declare_parameter("simple_max_accel", 1.5)
+        self.declare_parameter("simple_lookahead", 3)
+        self.declare_parameter("simple_goal_tolerance", 0.25)
         self.declare_parameter("use_esdf", False)
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
         self.declare_parameter("esdf_frame_id", "map_origin")
@@ -45,6 +54,14 @@ class MPCDroneControlNode(Node):
         self._control_frequency = float(self.get_parameter("control_frequency").value)
         self._velocity_scale = float(self.get_parameter("velocity_scale").value)
         self._min_speed = float(self.get_parameter("min_speed").value)
+        self._simple_mode = bool(self.get_parameter("simple_mode").value)
+        self._simple_kp_xy = float(self.get_parameter("simple_kp_xy").value)
+        self._simple_kp_z = float(self.get_parameter("simple_kp_z").value)
+        self._simple_max_speed_xy = float(self.get_parameter("simple_max_speed_xy").value)
+        self._simple_max_speed_z = float(self.get_parameter("simple_max_speed_z").value)
+        self._simple_max_accel = float(self.get_parameter("simple_max_accel").value)
+        self._simple_lookahead = int(self.get_parameter("simple_lookahead").value)
+        self._simple_goal_tolerance = float(self.get_parameter("simple_goal_tolerance").value)
 
         # 共享状态
         self._lock = threading.Lock()
@@ -60,9 +77,14 @@ class MPCDroneControlNode(Node):
         self._actual_state = np.zeros((1, 12))
         self._num_robots = 1
         self._esdf_adapter = None
+        self._last_odom_pos = None
+        self._last_odom_time_ns = None
+        self._last_cmd_world = np.zeros(3, dtype=float)
         self._state_frame_id = None  # 由 Odometry.header.frame_id 决定
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        # Humble 的 RcutilsLogger 无 info_throttle/warn_throttle，用手动节流键控
+        self._warn_last_ns: Dict[str, int] = {}
         if self.get_parameter("use_esdf").value:
             try:
                 from rover3d_navigation.esdf_adapter import EsdfShmAdapter
@@ -86,7 +108,7 @@ class MPCDroneControlNode(Node):
             except Exception as e:
                 self.get_logger().warn("ESDF constraint disabled: %s" % e)
 
-        # 订阅 / 发布（定位：global_odom = Swarm-LIO2 + map_fusion）
+        # 订阅 / 发布（定位可用 gt/odom 或 global_odom）
         self._odom_suffix = str(self.get_parameter("odom_suffix").value)
         self._odom_sub = self.create_subscription(
             Odometry, self._odom_suffix, self._odom_cb, 10
@@ -99,7 +121,20 @@ class MPCDroneControlNode(Node):
         # 控制定时器 (10 Hz)
         self._timer = self.create_timer(1.0 / self._control_frequency, self._control_timer_cb)
 
-        self.get_logger().info("mpc_drone_control node started")
+        if self._simple_mode:
+            self.get_logger().info("mpc_drone_control node started in simple_mode")
+        else:
+            self.get_logger().info("mpc_drone_control node started in mpc_mode")
+
+    def _throttle_allow(self, key: str, period_sec: float) -> bool:
+        """Humble 无 Logger.*_throttle：用节点时钟做同类节流。返回 True 表示本次应输出日志。"""
+        now_ns = self.get_clock().now().nanoseconds
+        period_ns = int(max(period_sec, 0.0) * 1e9)
+        prev = self._warn_last_ns.get(key)
+        if prev is None or (now_ns - prev) >= period_ns:
+            self._warn_last_ns[key] = now_ns
+            return True
+        return False
 
     def _quat_to_yaw(self, q):
         """从四元数 (x,y,z,w) 提取 yaw（绕 z 轴）"""
@@ -131,21 +166,88 @@ class MPCDroneControlNode(Node):
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         yaw = self._quat_to_yaw(q)
+        pos = np.array([p.x, p.y, p.z], dtype=float)
+        now_ns = self.get_clock().now().nanoseconds
+        vel = None
+        if self._last_odom_pos is not None and self._last_odom_time_ns is not None:
+            dt = (now_ns - self._last_odom_time_ns) * 1e-9
+            if dt > 1e-4:
+                vel = (pos - self._last_odom_pos) / dt
+        self._last_odom_pos = pos
+        self._last_odom_time_ns = now_ns
         if self._state_frame_id is None and getattr(msg.header, "frame_id", ""):
             self._state_frame_id = msg.header.frame_id
         with self._lock:
             self._state[0] = p.x
             self._state[3] = p.y
             self._state[6] = p.z
-            # 不读 Odom 中的 twist（TF 不提供，恒为 0），速度由 MPC 预测值维持
-            # self._state[1], [4], [7] 由 _control_timer_cb 中 MPC 输出写回
+            if vel is not None and np.isfinite(vel).all():
+                alpha = 0.4
+                self._state[1] = (1.0 - alpha) * self._state[1] + alpha * float(vel[0])
+                self._state[4] = (1.0 - alpha) * self._state[4] + alpha * float(vel[1])
+                self._state[7] = (1.0 - alpha) * self._state[7] + alpha * float(vel[2])
             self._state[9] = yaw
             self._state_valid = True
 
+    def _simple_control_step(self, state: np.ndarray, trajectory_points: np.ndarray) -> Twist:
+        """基础轨迹跟踪：P 速度控制 + 速度/加速度限幅，适配 Gazebo MulticopterVelocityControl。"""
+        cur = np.array([state[0], state[3], state[6]], dtype=float)
+        pts = np.asarray(trajectory_points, dtype=float).reshape(-1, 3)
+        if pts.shape[0] == 0:
+            self._last_cmd_world[:] = 0.0
+            return Twist()
+
+        dist_all = np.linalg.norm(pts - cur.reshape(1, 3), axis=1)
+        nearest = int(np.argmin(dist_all))
+        target_idx = min(nearest + max(self._simple_lookahead, 0), pts.shape[0] - 1)
+        target = pts[target_idx]
+        goal = pts[-1]
+        err = target - cur
+        goal_dist = float(np.linalg.norm(goal - cur))
+
+        if goal_dist < self._simple_goal_tolerance:
+            self._last_cmd_world[:] = 0.0
+            return Twist()
+
+        v_world = np.array(
+            [
+                self._simple_kp_xy * err[0],
+                self._simple_kp_xy * err[1],
+                self._simple_kp_z * err[2],
+            ],
+            dtype=float,
+        )
+
+        v_xy = v_world[:2]
+        n_xy = float(np.linalg.norm(v_xy))
+        if n_xy > self._simple_max_speed_xy > 1e-6:
+            v_world[:2] = v_xy / n_xy * self._simple_max_speed_xy
+        v_world[2] = float(np.clip(v_world[2], -self._simple_max_speed_z, self._simple_max_speed_z))
+        if self._min_speed > 1e-6 and goal_dist > self._simple_goal_tolerance * 2.0:
+            v_world = self._apply_min_speed_horizontal(v_world)
+
+        dv = v_world - self._last_cmd_world
+        max_dv = max(self._simple_max_accel, 1e-6) * self._dt
+        dv_norm = float(np.linalg.norm(dv))
+        if dv_norm > max_dv:
+            dv = dv / dv_norm * max_dv
+            v_world = self._last_cmd_world + dv
+        self._last_cmd_world = v_world
+
+        v_body = self._world_to_body_velocity(v_world, state[9])
+        v_body[0] *= self._velocity_scale
+        v_body[1] *= self._velocity_scale
+        twist = Twist()
+        twist.linear.x = float(v_body[0])
+        twist.linear.y = float(v_body[1])
+        twist.linear.z = float(v_body[2])
+        return twist
+
     def _trajectory_cb(self, msg):
-        """收到新 Path 时更新参考轨迹，并标记可中断当前执行"""
-        if len(msg.poses) < 2:
-            self.get_logger().warn("Trajectory has fewer than 2 poses, ignored")
+        """收到新 Path 时更新参考轨迹，并标记可中断当前执行。"""
+        n = len(msg.poses)
+        if n == 0:
+            # 规划侧可能发空 Path（优化间隙/停机）；不刷屏
             return
 
         # 轨迹帧对齐：把 Path 里的点从各自 frame_id 变换到 MPC 当前使用的 state 坐标系。
@@ -182,6 +284,14 @@ class MPCDroneControlNode(Node):
                         f"TF transform Path point failed: {src_frame} -> {target_frame}. Using raw points.",
                     )
             pts = np.asarray(pts_list, dtype=float)
+
+        # 规划在「单步 APF / 单点保持」时可能只发 1 个 pose；get_3d_trajectories + MPC 至少需要 2 点
+        if pts.shape[0] < 2:
+            pts = np.vstack([pts, pts[-1:]])
+            if self._throttle_allow("traj_single_pose_dup", 10.0):
+                self.get_logger().info(
+                    "Reference Path had only one pose; duplicated end point for MPC."
+                )
 
         with self._lock:
             self._trajectory_points = pts
@@ -246,11 +356,16 @@ class MPCDroneControlNode(Node):
 
         if trajectory_points is None or len(trajectory_points) < 2:
             # 无轨迹：发布零速
+            self._last_cmd_world[:] = 0.0
             twist = Twist()
             self._cmd_pub.publish(twist)
             return
 
         current_pos = [state[0], state[3], state[6]]
+        if self._simple_mode:
+            twist = self._simple_control_step(state, trajectory_points)
+            self._cmd_pub.publish(twist)
+            return
 
         with self._lock:
             if new_flag or not self._mpc_initialized:
@@ -319,12 +434,14 @@ class MPCDroneControlNode(Node):
         # 发布 Twist：MPC 受 v_max 限制；min_speed 仅水平；velocity_scale 仅 x/y 机体系分量
         v = np.array(agent.velocity, dtype=float)
         if not np.isfinite(v).all():
-            self.get_logger().warn_throttle(1.0, "MPC velocity contains NaN/inf, clamping to 0")
+            if self._throttle_allow("mpc_vel_nan", 1.0):
+                self.get_logger().warn("MPC velocity contains NaN/inf, clamping to 0")
         v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
         v = self._apply_min_speed_horizontal(v)
         ov = np.array(getattr(agent, "angular_velocity", [0.0, 0.0, 0.0]), dtype=float)
         if not np.isfinite(ov).all():
-            self.get_logger().warn_throttle(1.0, "MPC angular_velocity contains NaN/inf, clamping to 0")
+            if self._throttle_allow("mpc_ang_nan", 1.0):
+                self.get_logger().warn("MPC angular_velocity contains NaN/inf, clamping to 0")
         ov = np.nan_to_num(ov, nan=0.0, posinf=0.0, neginf=0.0)
         yaw = state[9]
         v_body = self._world_to_body_velocity(v, yaw)

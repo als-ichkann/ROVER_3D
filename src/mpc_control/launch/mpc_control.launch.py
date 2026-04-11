@@ -27,10 +27,18 @@ def _parse_robot_names(raw: str) -> List[str]:
 
 def _mpc_control_setup(context, *args, **kwargs):
     robots_raw = LaunchConfiguration("robots").perform(context)
-    vel_scale = LaunchConfiguration("velocity_scale", default="1.1").perform(context)
-    min_speed = LaunchConfiguration("min_speed", default="0.22").perform(context)
+    vel_scale = LaunchConfiguration("velocity_scale", default="1.0").perform(context)
+    min_speed = LaunchConfiguration("min_speed", default="0.0").perform(context)
     odom_suffix = LaunchConfiguration("odom_suffix", default="global_odom").perform(context)
     use_esdf = LaunchConfiguration("use_esdf", default="false").perform(context)
+    simple_mode = LaunchConfiguration("simple_mode", default="true").perform(context)
+    simple_kp_xy = LaunchConfiguration("simple_kp_xy", default="1.0").perform(context)
+    simple_kp_z = LaunchConfiguration("simple_kp_z", default="1.2").perform(context)
+    simple_max_speed_xy = LaunchConfiguration("simple_max_speed_xy", default="0.9").perform(context)
+    simple_max_speed_z = LaunchConfiguration("simple_max_speed_z", default="0.45").perform(context)
+    simple_max_accel = LaunchConfiguration("simple_max_accel", default="1.5").perform(context)
+    simple_lookahead = LaunchConfiguration("simple_lookahead", default="3").perform(context)
+    simple_goal_tolerance = LaunchConfiguration("simple_goal_tolerance", default="0.25").perform(context)
     esdf_mode = LaunchConfiguration("esdf_mode", default="shm").perform(context)
     esdf_shm_name = LaunchConfiguration("esdf_shm_name", default="/fiesta_esdf").perform(context)
     esdf_grid_topic = LaunchConfiguration("esdf_grid_topic", default="/esdf/grid_full").perform(context)
@@ -42,6 +50,14 @@ def _mpc_control_setup(context, *args, **kwargs):
         "velocity_scale": float(vel_scale),
         "min_speed": float(min_speed),
         "odom_suffix": odom_suffix,
+        "simple_mode": simple_mode.lower() in ("true", "1", "yes"),
+        "simple_kp_xy": float(simple_kp_xy),
+        "simple_kp_z": float(simple_kp_z),
+        "simple_max_speed_xy": float(simple_max_speed_xy),
+        "simple_max_speed_z": float(simple_max_speed_z),
+        "simple_max_accel": float(simple_max_accel),
+        "simple_lookahead": int(simple_lookahead),
+        "simple_goal_tolerance": float(simple_goal_tolerance),
         "use_esdf": use_esdf.lower() in ("true", "1", "yes"),
         "esdf_mode": esdf_mode,
         "esdf_shm_name": esdf_shm_name,
@@ -88,18 +104,58 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "velocity_scale",
-            default_value="1.1",
+            default_value="1.0",
             description="在 MPC 线速度基础上再乘该系数（world→body 之后）",
         ),
         DeclareLaunchArgument(
             "min_speed",
-            default_value="0.22",
+            default_value="0.0",
             description="水平面最小合速度 (m/s)；垂向 vz 不参与 min_speed，避免被放大成下坠",
         ),
         DeclareLaunchArgument(
             "odom_suffix",
             default_value="global_odom",
-            description="定位话题：global_odom (Swarm-LIO2+map_fusion)，可改为 gt/odom 用于纯仿真",
+            description="定位话题：默认 global_odom（Swarm-LIO2+map_fusion）；纯仿真可改为 gt/odom",
+        ),
+        DeclareLaunchArgument(
+            "simple_mode",
+            default_value="true",
+            description="基础控制模式：P 速度跟踪 + 限速/限加速度（推荐仿真默认开启）",
+        ),
+        DeclareLaunchArgument(
+            "simple_kp_xy",
+            default_value="1.0",
+            description="基础控制 XY 比例增益",
+        ),
+        DeclareLaunchArgument(
+            "simple_kp_z",
+            default_value="1.2",
+            description="基础控制 Z 比例增益",
+        ),
+        DeclareLaunchArgument(
+            "simple_max_speed_xy",
+            default_value="0.9",
+            description="基础控制 XY 最大速度 [m/s]",
+        ),
+        DeclareLaunchArgument(
+            "simple_max_speed_z",
+            default_value="0.45",
+            description="基础控制 Z 最大速度 [m/s]",
+        ),
+        DeclareLaunchArgument(
+            "simple_max_accel",
+            default_value="1.5",
+            description="基础控制线加速度限幅 [m/s^2]（建议不超过 Gazebo 模型的 2.0）",
+        ),
+        DeclareLaunchArgument(
+            "simple_lookahead",
+            default_value="3",
+            description="基础控制轨迹前视点偏移（按离最近点索引）",
+        ),
+        DeclareLaunchArgument(
+            "simple_goal_tolerance",
+            default_value="0.25",
+            description="基础控制终点停止阈值 [m]",
         ),
         DeclareLaunchArgument(
             "use_esdf",

@@ -8,6 +8,38 @@ from .Controller import controller
 from .esdf_constraint import compute_esdf_inequality_constraints
 
 
+def reference_velocity_from_dp(dp, dt, v_xy_max, vz_max):
+    """
+    由相邻参考点差分得到参考速度：与 control() 内 referencelist 构造一致，
+    并对垂向单独限速，避免 QP 用 vmax 当 vz 上界时与真实多旋翼 vz 能力不匹配导致颠簸。
+    """
+    dp = np.asarray(dp, dtype=float).reshape(3)
+    rp_diff = float(np.linalg.norm(dp))
+    if rp_diff < 1e-9:
+        return np.zeros(3, dtype=float)
+    u = dp / rp_diff
+    s = min(rp_diff / float(dt), float(v_xy_max) * 0.75)
+    vr = (u * s).astype(float)
+    vz_cap = float(vz_max) * 0.99
+    vr[2] = float(np.clip(vr[2], -vz_cap, vz_cap))
+    return vr
+
+
+def _state_bounds_vector(controller_or_self, agent):
+    """Fx0 不等式右侧常数项用的各轴速度上界：xy 用 vmax，z 用 vzmax。"""
+    vxymax = float(agent.vmax)
+    vzmax = float(getattr(agent, "vzmax", vxymax))
+    am = float(controller_or_self.a_max)
+    return np.array([
+        controller_or_self.xb, vxymax, am,
+        -controller_or_self.xa, vxymax, am,
+        controller_or_self.yb, vxymax, am,
+        -controller_or_self.ya, vxymax, am,
+        controller_or_self.zb, vzmax, am,
+        -controller_or_self.za, vzmax, am,
+    ], dtype=float)
+
+
 def _as_vec3(row, fallback=None):
     """将参考点行转为 (3,) float，避免空数组 (0,) 赋给 positions[t] 触发广播错误。"""
     a = np.asarray(row, dtype=float).reshape(-1)
@@ -191,7 +223,7 @@ class MPC_3D:
         R = np.array([
             [0.1, 0, 0],                                #控制权重矩阵
             [0, 0.1, 0],
-            [0, 0, 0.1]
+            [0, 0, 0.35]                                # 垂向 jerk 略增，减轻 vz 来回抖
         ])
 
         # 状态约束矩阵，确定各状态量上下界
@@ -244,9 +276,8 @@ class MPC_3D:
                         continue
 
                     # ---------- 参考速度 ----------
-                    rp_diff = np.linalg.norm(agent.rp[t + k + 1] - agent.rp[t + k])
-                    rp_diff = max(rp_diff, 1e-6)                         # 防 0
-                    vr = (agent.rp[t + k + 1] - agent.rp[t + k]) / rp_diff * min(rp_diff / self.dt, agent.vmax*0.75)
+                    dp = agent.rp[t + k + 1] - agent.rp[t + k]
+                    vr = reference_velocity_from_dp(dp, self.dt, agent.vmax, agent.vzmax)
 
                     # ---------- 参考状态 ----------
                     xr = np.array([agent.rp[t + k, 0], vr[0], 0,
@@ -255,14 +286,7 @@ class MPC_3D:
                     self.referencelist[i][t + k] = xr
 
                     # ---------- 状态约束 ----------
-                    constraint_vec = np.array([
-                        self.xb,  agent.vmax, self.a_max,
-                    -self.xa,  agent.vmax, self.a_max,
-                        self.yb,  agent.vmax, self.a_max,
-                    -self.ya,  agent.vmax, self.a_max,
-                        self.zb,  agent.vmax, self.a_max,
-                    -self.za,  agent.vmax, self.a_max
-                    ])
+                    constraint_vec = _state_bounds_vector(self, agent)
                     self.gx[i][t + k] = constraint_vec - self.Fx0 @ xr
 
             x = np.zeros((self.n, self.NT + 1))
@@ -347,9 +371,8 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
                 continue
 
             # ---------- 参考速度 ----------
-            rp_diff = np.linalg.norm(agent.rp[t + j + 1] - agent.rp[t + j])
-            rp_diff = max(rp_diff, 1e-6)                         # 防 0
-            vr = (agent.rp[t + j + 1] - agent.rp[t + j]) / rp_diff * min(rp_diff / Controller.dt, agent.vmax*0.75)
+            dp = agent.rp[t + j + 1] - agent.rp[t + j]
+            vr = reference_velocity_from_dp(dp, Controller.dt, agent.vmax, agent.vzmax)
 
             # ---------- 参考状态 ----------
             xr = np.array([agent.rp[t + j, 0], vr[0], 0,
@@ -358,14 +381,7 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
             Controller.referencelist[agent_index][t + j] = xr
 
             # ---------- 状态约束 ----------
-            constraint_vec = np.array([
-                Controller.xb,  agent.vmax, Controller.a_max,
-            -Controller.xa,  agent.vmax, Controller.a_max,
-                Controller.yb,  agent.vmax, Controller.a_max,
-            -Controller.ya,  agent.vmax, Controller.a_max,
-                Controller.zb,  agent.vmax, Controller.a_max,
-            -Controller.za,  agent.vmax, Controller.a_max
-            ])
+            constraint_vec = _state_bounds_vector(Controller, agent)
             Controller.gx[agent_index][t + j] = constraint_vec - Controller.Fx0 @ xr
     all_time = time.time()
 
@@ -392,13 +408,8 @@ def agent_thread_3D(agent, Controller, agent_index, actualState, k, lastz, lasts
 
     # ========== 参考轨迹处理 ==========
     # 用于构造参考状态 xr（可用于代价/不等式约束；动力学等式不直接用它）
-    rp_diff = float(np.linalg.norm(agent.rp[k + 1] - agent.rp[k]))
-    if rp_diff < 1e-9:
-        rp_diff = 1e-9  # 防 0
-    vr = (agent.rp[k + 1] - agent.rp[k]) / Controller.dt
-    vmax_ref = agent.vmax * 0.75
-    if np.linalg.norm(vr) > vmax_ref:
-        vr = (agent.rp[k + 1] - agent.rp[k]) / rp_diff * vmax_ref
+    dp = agent.rp[k + 1] - agent.rp[k]
+    vr = reference_velocity_from_dp(dp, Controller.dt, agent.vmax, agent.vzmax)
 
     xr = np.array([
         agent.rp[k, 0], vr[0], 0,
