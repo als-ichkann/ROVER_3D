@@ -1,0 +1,113 @@
+<?xml version="1.0" ?>
+<sdf version='1.7'>
+  <world name='default'>
+    <light name='sun' type='directional'>
+      <cast_shadows>1</cast_shadows>
+      <pose>0 0 30 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name='ground_plane'>
+      <static>1</static>
+      <link name='link'>
+        <collision name='collision'>
+          <geometry><plane><normal>0 0 1</normal><size>500 500</size></plane></geometry>
+        </collision>
+        <visual name='visual'>
+          <cast_shadows>0</cast_shadows>
+          <geometry><plane><normal>0 0 1</normal><size>500 500</size></plane></geometry>
+          <material>
+            <ambient>0.7 0.7 0.7 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+            <specular>0.2 0.2 0.2 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <gravity>0 0 -9.8</gravity>
+    <atmosphere type='adiabatic'/>
+    <physics type='ode'>
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1</real_time_factor>
+      <real_time_update_rate>250</real_time_update_rate>
+    </physics>
+
+    <plugin filename="ignition-gazebo-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="ignition-gazebo-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="ignition-gazebo-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="ignition-gazebo-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+    <scene>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.7 0.7 0.7 1</background>
+      <shadows>1</shadows>
+    </scene>
+
+    <!-- (c) 近似：5m x 4.5m 小场地 + 更多障碍块（形成多通道） -->
+    <model name='arena_c'>
+      <static>1</static>
+      <pose>0 0 0 0 0 0</pose>
+
+      <!-- obstacles (整体放大 3 倍；去掉外边界围墙) -->
+      <link name='block_01'>
+        <pose>-4.5 3.6 1.5 0 0 0.1</pose>
+        <collision name='collision'><geometry><box><size>2.4 1.68 2.4</size></box></geometry></collision>
+        <visual name='visual'>
+          <geometry><box><size>2.4 1.68 2.4</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
+        </visual>
+      </link>
+      <link name='block_02'>
+        <pose>-0.6 1.8 1.5 0 0 -0.4</pose>
+        <collision name='collision'><geometry><box><size>2.64 1.92 2.4</size></box></geometry></collision>
+        <visual name='visual'>
+          <geometry><box><size>2.64 1.92 2.4</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
+        </visual>
+      </link>
+      <link name='block_03'>
+        <pose>3.9 3.6 1.5 0 0 0.3</pose>
+        <collision name='collision'><geometry><box><size>2.16 1.68 2.4</size></box></geometry></collision>
+        <visual name='visual'>
+          <geometry><box><size>2.16 1.68 2.4</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
+        </visual>
+      </link>
+      <link name='block_04'>
+        <pose>2.4 -1.2 1.5 0 0 -0.2</pose>
+        <collision name='collision'><geometry><box><size>3.12 1.92 2.4</size></box></geometry></collision>
+        <visual name='visual'>
+          <geometry><box><size>3.12 1.92 2.4</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
+        </visual>
+      </link>
+      <link name='block_05'>
+        <pose>-2.7 -3.0 1.5 0 0 0.25</pose>
+        <collision name='collision'><geometry><box><size>2.4 2.16 2.4</size></box></geometry></collision>
+        <visual name='visual'>
+          <geometry><box><size>2.4 2.16 2.4</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <gui fullscreen='0'>
+      <camera name='user_camera'>
+        <pose>-24 0 21 0 0.85 0</pose>
+        <view_controller>orbit</view_controller>
+        <projection_type>perspective</projection_type>
+      </camera>
+    </gui>
+  </world>
+</sdf>
