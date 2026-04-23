@@ -3,7 +3,7 @@
   <world name='default'>
     <light name='sun' type='directional'>
       <cast_shadows>1</cast_shadows>
-      <pose>0 0 30 0 0 0</pose>
+      <pose>0 0 10 0 -0 0</pose>
       <diffuse>0.8 0.8 0.8 1</diffuse>
       <specular>0.2 0.2 0.2 1</specular>
       <attenuation>
@@ -13,6 +13,11 @@
         <quadratic>0.001</quadratic>
       </attenuation>
       <direction>-0.5 0.1 -0.9</direction>
+      <spot>
+        <inner_angle>0</inner_angle>
+        <outer_angle>0</outer_angle>
+        <falloff>0</falloff>
+      </spot>
     </light>
 
     <model name='ground_plane'>
@@ -25,6 +30,23 @@
               <size>500 500</size>
             </plane>
           </geometry>
+          <surface>
+            <contact>
+              <collide_bitmask>65535</collide_bitmask>
+              <ode/>
+            </contact>
+            <friction>
+              <ode>
+                <mu>100</mu>
+                <mu2>50</mu2>
+              </ode>
+              <torsional>
+                <ode/>
+              </torsional>
+            </friction>
+            <bounce/>
+          </surface>
+          <max_contacts>10</max_contacts>
         </collision>
         <visual name='visual'>
           <cast_shadows>0</cast_shadows>
@@ -38,12 +60,24 @@
             <ambient>0.7 0.7 0.7 1</ambient>
             <diffuse>0.7 0.7 0.7 1</diffuse>
             <specular>0.2 0.2 0.2 1</specular>
+            <emissive>0 0 0 1</emissive>
+            <pbr>
+              <metal>
+                <albedo>0.7 0.7 0.7 1</albedo>
+                <roughness>0.4</roughness>
+                <metalness>0</metalness>
+              </metal>
+            </pbr>
           </material>
         </visual>
+        <self_collide>0</self_collide>
+        <enable_wind>0</enable_wind>
+        <kinematic>0</kinematic>
       </link>
     </model>
 
     <gravity>0 0 -9.8</gravity>
+    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
     <atmosphere type='adiabatic'/>
     <physics type='ode'>
       <max_step_size>0.004</max_step_size>
@@ -55,6 +89,7 @@
     <plugin filename="ignition-gazebo-sensors-system" name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>
+    <plugin filename="ignition-gazebo-imu-system" name="gz::sim::systems::Imu"/>
     <plugin filename="ignition-gazebo-user-commands-system" name="gz::sim::systems::UserCommands"/>
     <plugin filename="ignition-gazebo-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 
@@ -62,43 +97,48 @@
       <ambient>0.4 0.4 0.4 1</ambient>
       <background>0.7 0.7 0.7 1</background>
       <shadows>1</shadows>
+      <grid>true</grid>
     </scene>
+    <wind/>
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <latitude_deg>0</latitude_deg>
+      <longitude_deg>0</longitude_deg>
+      <elevation>0</elevation>
+      <heading_deg>0</heading_deg>
+    </spherical_coordinates>
 
-    <!-- (a) 近似：一个 13m x 11m 房间 + 3 个大障碍块 -->
-    <model name='arena_a'>
+    <model name='mess'>
       <static>1</static>
       <pose>0 0 0 0 0 0</pose>
-
-      <!-- blocks (整体放大 3 倍；去掉外边界围墙) -->
-      <link name='block_01'>
-        <pose>-7.5 4.5 2.7 0 0 0.2</pose>
-        <collision name='collision'><geometry><box><size>10.08 6.24 4.32</size></box></geometry></collision>
+      <link name='base_link'>
+        <collision name='collision'>
+          <geometry>
+            <mesh>
+              <uri>mess_scene/base_link.STL</uri>
+              <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
+        </collision>
         <visual name='visual'>
-          <geometry><box><size>10.08 6.24 4.32</size></box></geometry>
-          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
-        </visual>
-      </link>
-      <link name='block_02'>
-        <pose>9.6 9.0 2.25 0 0 -0.3</pose>
-        <collision name='collision'><geometry><box><size>7.68 4.8 3.6</size></box></geometry></collision>
-        <visual name='visual'>
-          <geometry><box><size>7.68 4.8 3.6</size></box></geometry>
-          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
-        </visual>
-      </link>
-      <link name='block_03'>
-        <pose>4.5 -9.6 2.25 0 0 0.1</pose>
-        <collision name='collision'><geometry><box><size>8.64 5.76 3.6</size></box></geometry></collision>
-        <visual name='visual'>
-          <geometry><box><size>8.64 5.76 3.6</size></box></geometry>
-          <material><ambient>0.5 0.5 0.5 1</ambient><diffuse>0.5 0.5 0.5 1</diffuse></material>
+          <geometry>
+            <mesh>
+              <uri>mess_scene/base_link.STL</uri>
+              <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <ambient>0.79 0.82 0.93 1</ambient>
+            <diffuse>0.79 0.82 0.93 1</diffuse>
+            <specular>0.2 0.2 0.2 1</specular>
+          </material>
         </visual>
       </link>
     </model>
 
     <gui fullscreen='0'>
       <camera name='user_camera'>
-        <pose>-54 0 42 0 0.7 0</pose>
+        <pose>-25 25 18 0 0.5 -0.9</pose>
         <view_controller>orbit</view_controller>
         <projection_type>perspective</projection_type>
       </camera>
