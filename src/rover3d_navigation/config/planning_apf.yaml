@@ -8,12 +8,14 @@ planning_apf_node:
     control_rate: 5.0
     max_apf_try: 10
     gmm_interp_steps: 5
+    apf_goal_lock_radius: 0.25
+    slp_epsilon: 0.2
     use_gmm_trajectory_slp: true
-    esdf_service: "esdf/query"
-    esdf_grid_topic: "/esdf/grid_full"
-    use_esdf_grid_cache: true
-    esdf_mode: "shm"         # shm | grid_cache | service. shm=共享内存零拷贝，需 FIESTA use_esdf_shm:=true
+    esdf_mode: "shm"         # 仅支持 shm（共享内存零拷贝）
     esdf_shm_name: "/fiesta_esdf"
+    signed_sdf_enable: true
+    signed_sdf_occupied_eps: 1.0e-6
+    signed_sdf_inside_offset_vox: 0.5
     esdf_frame_id: "map_origin"
     map_origin_x: -5.0
     map_origin_y: -7.5

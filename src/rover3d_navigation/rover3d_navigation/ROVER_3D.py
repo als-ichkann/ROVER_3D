@@ -158,6 +158,8 @@ class PlanningAPFProcess:
         goal_weights: list,
         gmm_interp_steps: int = 5,
         max_apf_try: int = 10,
+        apf_goal_lock_radius: float = 0.25,
+        slp_epsilon: float = 0.2,
         use_gmm_trajectory_slp: bool = True,
         config_dir: Optional[str] = None,
     ):
@@ -168,6 +170,8 @@ class PlanningAPFProcess:
         self.za, self.zb = za, zb
         self.gmm_interp_steps = gmm_interp_steps
         self.max_apf_try = max_apf_try
+        self.apf_goal_lock_radius = max(0.0, float(apf_goal_lock_radius))
+        self.slp_epsilon = float(slp_epsilon)
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
         self.alpha = 0.05
 
@@ -179,6 +183,12 @@ class PlanningAPFProcess:
         # 发布的目标点自动归并到最近的离散 GC 节点
         self.fmeans, self.fcovs, self.fweights = _map_goals_to_nearest_gc(
             goal_means, goal_covs, goal_weights, self.GC_means, self.GC_covs
+        )
+        print(
+            f"[GOAL] raw_goal_means={goal_means}, raw_goal_weights={goal_weights}"
+        )
+        print(
+            f"[GOAL] mapped_fmeans={self.fmeans}, mapped_fweights={self.fweights}"
         )
         # 节点列表仅含 GC 离散节点，不含目标点（目标已映射到 GC）
         self.conbinedmeans_list = list(self.GC_means)
@@ -208,17 +218,6 @@ class PlanningAPFProcess:
         self.robots_positions_expected: Optional[np.ndarray] = None
         self.stop_flag = False
 
-    def _gmm_score_samples(self, means, covs, weights, points: np.ndarray) -> np.ndarray:
-        """用 GMM 对点集计算 log 概率。"""
-        from sklearn.mixture import GaussianMixture
-        n_comp = len(means)
-        gmm = GaussianMixture(n_components=n_comp, covariance_type='full')
-        gmm.means_ = np.array(means)
-        gmm.covariances_ = np.array([np.asarray(c).reshape(3, 3) for c in covs])
-        gmm.weights_ = np.array(weights)
-        gmm.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(gmm.covariances_))
-        return gmm.score_samples(points)
-
     def run_one_cycle(
         self, robots_positions: np.ndarray
     ) -> Optional[Tuple[List[np.ndarray], bool]]:
@@ -242,30 +241,6 @@ class PlanningAPFProcess:
                 return None
             self.robots_positions_expected = np.array(robots_positions, copy=True)
             rpe = self.robots_positions_expected
-            # 检查是否需要重新估计当前 GMM
-            if len(self.GMM) > 0 and self.step > 0:
-                curr = self.GMM[self.step - 1] if self.step > 0 else [self.current_means, self.current_covs, self.current_weights]
-                if len(curr) >= 3 and len(curr[0]) > 0:
-                    try:
-                        scores = self._gmm_score_samples(curr[0], curr[1], curr[2], rpe)
-                        if np.min(scores) < np.log(1e-4):
-                            self.current_means, self.current_covs, self.current_weights = control_law_3D.estimate_swarm_GMM_3D(
-                                self.conbinedmeans_list, self.conbinedcovs_list, rpe
-                            )
-                        else:
-                            self.current_means, self.current_covs, self.current_weights = curr[0], curr[1], curr[2]
-                    except Exception:
-                        self.current_means, self.current_covs, self.current_weights = control_law_3D.estimate_swarm_GMM_3D(
-                            self.conbinedmeans_list, self.conbinedcovs_list, rpe
-                        )
-                else:
-                    self.current_means, self.current_covs, self.current_weights = control_law_3D.estimate_swarm_GMM_3D(
-                        self.conbinedmeans_list, self.conbinedcovs_list, rpe
-                    )
-            else:
-                self.current_means, self.current_covs, self.current_weights = control_law_3D.estimate_swarm_GMM_3D(
-                    self.conbinedmeans_list, self.conbinedcovs_list, rpe
-                )
 
             if not self.use_gmm_trajectory_slp:
                 self.GMM = [[self.fmeans, self.fcovs, self.fweights]]
@@ -306,6 +281,8 @@ class PlanningAPFProcess:
                     self.Graph_GC,
                     self.Wasserstein_table,
                     self.Node_PDF_table,
+                    robots_positions=rpe,
+                    epsilon=self.slp_epsilon,
                 )
                 self.GMM, self.WStack = Planning_3D.interpGMM_PRM(
                     self.current_means,
@@ -334,6 +311,31 @@ class PlanningAPFProcess:
         # 每周期用实时 odom 作为 APF 起点。若沿用上一拍 APF 输出，多步开环会使
         # 「等效位置」漂移，吸引势相对虚点计算，易出现全体朝某一象限偏航（与目标均值无关）。
         self.robots_positions_expected = np.array(robots_positions, copy=True)
+
+        # 接近当前宏观目标时锁定当前位置，避免在吸引梯度接近 0 时被斥力继续推走。
+        if self.apf_goal_lock_radius > 0 and len(next_means) > 0:
+            weights_np = np.asarray(next_weights, dtype=float).reshape(-1)
+            means_np = np.asarray(next_means, dtype=float).reshape(-1, 3)
+            if np.sum(weights_np) > 1e-12 and means_np.shape[0] == weights_np.shape[0]:
+                weights_np = weights_np / np.sum(weights_np)
+                macro_center = np.average(means_np, axis=0, weights=weights_np)
+            else:
+                macro_center = np.mean(means_np, axis=0)
+            swarm_center = np.mean(self.robots_positions_expected, axis=0)
+            center_dist = float(np.linalg.norm(swarm_center - macro_center))
+            if center_dist <= self.apf_goal_lock_radius:
+                trajectories = [
+                    np.array([self.robots_positions_expected[i]], dtype=float)
+                    for i in range(self.num_robots)
+                ]
+                print(
+                    f"[APF] lock at macro target: step={self.step}, "
+                    f"center_dist={center_dist:.4f}, radius={self.apf_goal_lock_radius:.4f}"
+                )
+                if self.step == len(self.GMM) - 1:
+                    self.goalFlag = 1
+                self.step += 1
+                return trajectories, self.stop_flag
 
         # APF 一步
         self.robots_positions_expected, robots_positions_list, _, _, _ = control_law_3D.APF(

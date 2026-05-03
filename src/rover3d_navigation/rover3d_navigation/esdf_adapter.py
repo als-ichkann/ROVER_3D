@@ -1,10 +1,10 @@
 """
-ESDF Map Adapters for APF obstacle avoidance.
-- EsdfMapAdapter: Uses esdf/query ROS2 service (higher latency).
-- EsdfGridCache: Subscribes to /esdf/grid_full, local in-memory query (low latency).
-- EsdfShmAdapter: 共享内存零拷贝，mmap 直接读 FIESTA 导出的 ESDF，无 ROS 序列化。
-  需 FIESTA 以 use_esdf_shm:=true 启动；比 topic 快数十倍。
-All expose get_esdf, compute_gradient, is_collision_line_segment interface.
+ESDF adapter for planner: shared-memory zero-copy only.
+
+说明：
+- 仅保留 EsdfShmAdapter，不再支持 service/topic 查询。
+- 在 SHM 读取的非负 ESDF 上构建 signed SDF（障碍内部为负值），
+  以支持 CVaR 长尾风险计算。
 """
 
 from __future__ import annotations
@@ -15,34 +15,67 @@ import sys
 from typing import Optional, Union
 
 import numpy as np
-import rclpy
 from rclpy.node import Node
+from scipy.ndimage import distance_transform_edt
 
-try:
-    from esdf_map.srv import QueryEsdf
-except ImportError:
-    QueryEsdf = None
+from .trilinear_esdf import query_esdf_trilinear
 
-try:
-    from std_msgs.msg import Float32MultiArray
-except ImportError:
-    Float32MultiArray = None
-
-# 共享内存布局（与 FIESTA esdf_shm.hpp 一致）
 _SHM_MAGIC = b"FIESESDF"
 _SHM_HEADER_SIZE = 56
 
 
-class EsdfMapAdapter:
+def _trilinear_scalar(
+    grid: np.ndarray, ix0: int, iy0: int, iz0: int, dx: float, dy: float, dz: float
+) -> float:
+    v000 = float(grid[ix0, iy0, iz0])
+    v001 = float(grid[ix0, iy0, iz0 + 1])
+    v010 = float(grid[ix0, iy0 + 1, iz0])
+    v011 = float(grid[ix0, iy0 + 1, iz0 + 1])
+    v100 = float(grid[ix0 + 1, iy0, iz0])
+    v101 = float(grid[ix0 + 1, iy0, iz0 + 1])
+    v110 = float(grid[ix0 + 1, iy0 + 1, iz0])
+    v111 = float(grid[ix0 + 1, iy0 + 1, iz0 + 1])
+    c00 = v000 * (1.0 - dz) + v001 * dz
+    c01 = v010 * (1.0 - dz) + v011 * dz
+    c10 = v100 * (1.0 - dz) + v101 * dz
+    c11 = v110 * (1.0 - dz) + v111 * dz
+    c0 = c00 * (1.0 - dy) + c01 * dy
+    c1 = c10 * (1.0 - dy) + c11 * dy
+    return float(c0 * (1.0 - dx) + c1 * dx)
+
+
+def _build_signed_sdf(
+    dist_grid: np.ndarray,
+    resolution: float,
+    occupied_eps: float,
+    inside_offset_vox: float,
+) -> np.ndarray:
     """
-    Adapter for esdf/query service. Exposes origin, dims, resolution and
-    get_esdf/compute_gradient/is_collision_line_segment for APF planners.
+    将非负 ESDF 转换为 signed SDF:
+    - 外部保持正值
+    - 障碍内部设为负值，幅值由“到自由空间边界的体素距离”给出
+    """
+    signed = np.asarray(dist_grid, dtype=np.float32).copy()
+    occ = signed <= float(occupied_eps)
+    if not np.any(occ):
+        return signed
+
+    inside_vox = distance_transform_edt(occ)
+    inside_m = np.maximum(inside_vox - float(inside_offset_vox), 0.0) * float(resolution)
+    signed[occ] = -inside_m[occ].astype(np.float32)
+    return signed
+
+
+class EsdfShmAdapter:
+    """
+    共享内存 ESDF 适配器（唯一实现）。
+    读取 FIESTA 导出的 SHM 栅格并构建 signed SDF。
     """
 
     def __init__(
         self,
         node: Node,
-        service_name: str = "esdf/query",
+        shm_name: str = "/fiesta_esdf",
         frame_id: str = "map_origin",
         map_origin_x: float = -5.0,
         map_origin_y: float = -7.5,
@@ -51,257 +84,145 @@ class EsdfMapAdapter:
         map_size_y: float = 17.0,
         map_size_z: float = 6.0,
         resolution: float = 0.15,
+        signed_sdf_enable: bool = True,
+        signed_sdf_occupied_eps: float = 1e-6,
+        signed_sdf_inside_offset_vox: float = 0.5,
     ) -> None:
         self._node = node
-        self._service_name = service_name
-        self._frame_id = frame_id
-        self.origin = (map_origin_x, map_origin_y, map_origin_z)
-        nx = max(1, int(round(map_size_x / resolution)))
-        ny = max(1, int(round(map_size_y / resolution)))
-        nz = max(1, int(round(map_size_z / resolution)))
-        self.dims = np.array([nx, ny, nz], dtype=int)
-        self.resolution = resolution
-
-        if QueryEsdf is None:
-            node.get_logger().warn(
-                "esdf_map.srv.QueryEsdf not found; ESDF queries will return defaults"
-            )
-            self._client = None
-            return
-
-        self._client = node.create_client(QueryEsdf, service_name)
-        if not self._client.wait_for_service(timeout_sec=5.0):
-            node.get_logger().warn(
-                f"esdf/query service '{service_name}' not available; "
-                "obstacle avoidance may be disabled"
-            )
-
-    def _query(self, x: float, y: float, z: float) -> Optional[tuple[float, np.ndarray]]:
-        """Query esdf/query service. Returns (distance, gradient) or None."""
-        if self._client is None or QueryEsdf is None:
-            return (5.0, np.zeros(3))  # safe default
-
-        if not self._client.service_is_ready():
-            return (5.0, np.zeros(3))
-
-        req = QueryEsdf.Request()
-        req.position.x = float(x)
-        req.position.y = float(y)
-        req.position.z = float(z)
-        req.frame_id = self._frame_id
-
-        try:
-            future = self._client.call_async(req)
-            rclpy.spin_until_future_complete(
-                self._node, future, timeout_sec=1.0
-            )
-            if not future.done():
-                return None
-            resp = future.result()
-            if resp is None or not resp.success:
-                return None
-            grad = np.array([resp.gradient.x, resp.gradient.y, resp.gradient.z])
-            return (float(resp.distance), grad)
-        except Exception:
-            return None
-
-    def get_esdf(self, pos: Union[np.ndarray, list, tuple]) -> Union[float, np.ndarray]:
-        """
-        Get ESDF distance at position(s).
-        pos: (3,) or (N, 3) array. Returns float or (N,) array.
-        """
-        pos = np.asarray(pos, dtype=float)
-        if pos.ndim == 1:
-            pos = pos.reshape(1, -1)
-        n = pos.shape[0]
-        dists = np.full(n, 5.0)  # default safe distance
-        for i in range(n):
-            r = self._query(float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2]))
-            if r is not None:
-                dists[i] = r[0]
-        return float(dists[0]) if n == 1 else dists
-
-    def compute_gradient(self, pos: Union[np.ndarray, list, tuple]) -> Optional[np.ndarray]:
-        """Get ESDF gradient at position. Returns (3,) array or None."""
-        pos = np.asarray(pos, dtype=float).flatten()
-        if len(pos) < 3:
-            return None
-        r = self._query(float(pos[0]), float(pos[1]), float(pos[2]))
-        if r is None:
-            return None
-        return r[1]
-
-    def is_collision_line_segment(
-        self,
-        point1: Union[np.ndarray, list, tuple],
-        point2: Union[np.ndarray, list, tuple],
-        safe_margin: float = 0.2,
-        num_samples: int = 10,
-    ) -> bool:
-        """
-        Check if line segment from point1 to point2 collides with obstacles.
-        Samples along the segment and returns True if any sample has distance < safe_margin.
-        """
-        p1 = np.asarray(point1, dtype=float).flatten()[:3]
-        p2 = np.asarray(point2, dtype=float).flatten()[:3]
-        for t in np.linspace(0, 1, num_samples):
-            pt = p1 + t * (p2 - p1)
-            r = self._query(float(pt[0]), float(pt[1]), float(pt[2]))
-            if r is None:
-                continue
-            if r[0] < safe_margin:
-                return True
-        return False
-
-
-class EsdfGridCache:
-    """
-    ESDF adapter backed by local grid cache. Subscribes to /esdf/grid_full,
-    queries in-memory with trilinear interpolation. Zero service round-trip.
-    Use when FIESTA publishes grid_full (publish_grid_full:=true).
-    """
-
-    def __init__(
-        self,
-        node: Node,
-        grid_topic: str = "/esdf/grid_full",
-        frame_id: str = "map_origin",
-        map_origin_x: float = -5.0,
-        map_origin_y: float = -7.5,
-        map_origin_z: float = 0.0,
-        map_size_x: float = 22.0,
-        map_size_y: float = 17.0,
-        map_size_z: float = 6.0,
-        resolution: float = 0.15,
-    ) -> None:
-        self._node = node
+        self._shm_name = shm_name
         self._frame_id = frame_id
         self.origin = (map_origin_x, map_origin_y, map_origin_z)
         self.resolution = float(resolution)
-        ox, oy, oz = self.origin
-        # Expected dims; updated when grid arrives
         nx = max(1, int(round(map_size_x / resolution)))
         ny = max(1, int(round(map_size_y / resolution)))
         nz = max(1, int(round(map_size_z / resolution)))
         self.dims = np.array([nx, ny, nz], dtype=int)
-        self._grid: Optional[np.ndarray] = None  # shape (nx, ny, nz) or (nx, ny, nz, 4)
-        self._has_gradient = False
+        self._grid_raw: Optional[np.ndarray] = None
+        self._dist_grid: Optional[np.ndarray] = None
         self._ready = False
 
-        if Float32MultiArray is None:
-            node.get_logger().warn("std_msgs.Float32MultiArray not found")
-            return
+        self.signed_sdf_enable = bool(signed_sdf_enable)
+        self.signed_sdf_occupied_eps = float(signed_sdf_occupied_eps)
+        self.signed_sdf_inside_offset_vox = float(signed_sdf_inside_offset_vox)
+        self._signed_stats_logged = False
 
-        qos = rclpy.qos.QoSProfile(
-            depth=1,
-            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
-            durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self._sub = node.create_subscription(
-            Float32MultiArray,
-            grid_topic,
-            self._cb_grid,
-            qos,
-        )
-        node.get_logger().info(
-            f"EsdfGridCache: subscribing to {grid_topic} (in-memory, zero service latency)"
+        self._refresh()
+        self._node.get_logger().info(
+            f"EsdfShmAdapter: use shared memory {shm_name}; "
+            f"signed_sdf={'on' if self.signed_sdf_enable else 'off'}"
         )
 
-    def _cb_grid(self, msg: "Float32MultiArray") -> None:
-        if len(msg.layout.dim) < 3:
-            return
-        nx = msg.layout.dim[0].size
-        ny = msg.layout.dim[1].size
-        nz = msg.layout.dim[2].size
-        nch = msg.layout.dim[3].size if len(msg.layout.dim) > 3 else 1
-        total = nx * ny * nz * max(nch, 1)
-        if len(msg.data) < total:
-            return
-        data = np.array(msg.data, dtype=np.float32)
-        if nch >= 4:
-            self._grid = data.reshape(nx, ny, nz, 4)
-            self._has_gradient = True
-        else:
-            self._grid = data.reshape(nx, ny, nz)
-            self._has_gradient = False
-        self.dims = np.array([nx, ny, nz], dtype=int)
-        self._ready = True
+    def _shm_path(self) -> str:
+        name = self._shm_name.lstrip("/") or "fiesta_esdf"
+        if sys.platform == "linux":
+            return f"/dev/shm/{name}"
+        return self._shm_name
 
-    def _trilinear_interp(
-        self, g: np.ndarray, ix0: int, iy0: int, iz0: int, dx: float, dy: float, dz: float
-    ) -> np.ndarray:
-        """Trilinear interpolation. g[i,j,k] or g[i,j,k,:], returns scalar or (4,) array."""
-        if g.ndim == 4:
-            v000 = g[ix0, iy0, iz0, :]
-            v001 = g[ix0, iy0, iz0 + 1, :]
-            v010 = g[ix0, iy0 + 1, iz0, :]
-            v011 = g[ix0, iy0 + 1, iz0 + 1, :]
-            v100 = g[ix0 + 1, iy0, iz0, :]
-            v101 = g[ix0 + 1, iy0, iz0 + 1, :]
-            v110 = g[ix0 + 1, iy0 + 1, iz0, :]
-            v111 = g[ix0 + 1, iy0 + 1, iz0 + 1, :]
-        else:
-            v000 = g[ix0, iy0, iz0]
-            v001 = g[ix0, iy0, iz0 + 1]
-            v010 = g[ix0, iy0 + 1, iz0]
-            v011 = g[ix0, iy0 + 1, iz0 + 1]
-            v100 = g[ix0 + 1, iy0, iz0]
-            v101 = g[ix0 + 1, iy0, iz0 + 1]
-            v110 = g[ix0 + 1, iy0 + 1, iz0]
-            v111 = g[ix0 + 1, iy0 + 1, iz0 + 1]
-        c00 = v000 * (1 - dz) + v001 * dz
-        c01 = v010 * (1 - dz) + v011 * dz
-        c10 = v100 * (1 - dz) + v101 * dz
-        c11 = v110 * (1 - dz) + v111 * dz
-        c0 = c00 * (1 - dy) + c01 * dy
-        c1 = c10 * (1 - dy) + c11 * dy
-        return c0 * (1 - dx) + c1 * dx
+    def _refresh(self) -> bool:
+        path = self._shm_path()
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "rb") as f:
+                header = f.read(_SHM_HEADER_SIZE)
+            if len(header) < _SHM_HEADER_SIZE or header[:8] != _SHM_MAGIC:
+                return False
+
+            nx, ny, nz = struct.unpack("<III", header[8:20])
+            res, ox, oy, oz = struct.unpack("<dddd", header[20:52])
+            data_size = nx * ny * nz * 4 * 4
+
+            with open(path, "rb") as f:
+                f.seek(_SHM_HEADER_SIZE)
+                data = np.frombuffer(f.read(data_size), dtype=np.float32)
+            if data.size != nx * ny * nz * 4:
+                return False
+
+            self._grid_raw = data.reshape(nx, ny, nz, 4)
+            self.dims = np.array([nx, ny, nz], dtype=int)
+            self.origin = (ox, oy, oz)
+            self.resolution = float(res)
+
+            base_dist = self._grid_raw[..., 0]
+            if self.signed_sdf_enable:
+                self._dist_grid = _build_signed_sdf(
+                    base_dist,
+                    self.resolution,
+                    self.signed_sdf_occupied_eps,
+                    self.signed_sdf_inside_offset_vox,
+                )
+            else:
+                self._dist_grid = base_dist.copy()
+
+            self._ready = True
+            return True
+        except (OSError, struct.error, ValueError):
+            return False
+
+    def _ensure_ready(self) -> bool:
+        if self._ready and self._dist_grid is not None:
+            return True
+        return self._refresh()
+
+    def _sample_signed(self, gx: float, gy: float, gz: float) -> float:
+        if self._dist_grid is None:
+            return 5.0
+        nx, ny, nz = self.dims
+        ix0 = int(np.clip(np.floor(gx), 0, nx - 2))
+        iy0 = int(np.clip(np.floor(gy), 0, ny - 2))
+        iz0 = int(np.clip(np.floor(gz), 0, nz - 2))
+        dx = float(np.clip(gx - ix0, 0.0, 1.0))
+        dy = float(np.clip(gy - iy0, 0.0, 1.0))
+        dz = float(np.clip(gz - iz0, 0.0, 1.0))
+        return _trilinear_scalar(self._dist_grid, ix0, iy0, iz0, dx, dy, dz)
 
     def _trilinear(self, x: float, y: float, z: float) -> tuple[float, np.ndarray]:
-        """Trilinear interpolation. Returns (dist, grad) from FIESTA grid or finite-diff fallback."""
-        if self._grid is None or not self._ready:
+        if not self._ensure_ready() or self._dist_grid is None:
             return (5.0, np.zeros(3))
         ox, oy, oz = self.origin
         res = self.resolution
         inv_res = 1.0 / res
-        ix_f = (x - ox) / res
-        iy_f = (y - oy) / res
-        iz_f = (z - oz) / res
-        nx, ny, nz = self.dims
-        ix0 = int(np.clip(np.floor(ix_f), 0, nx - 2))
-        iy0 = int(np.clip(np.floor(iy_f), 0, ny - 2))
-        iz0 = int(np.clip(np.floor(iz_f), 0, nz - 2))
-        dx = np.clip(ix_f - ix0, 0.0, 1.0)
-        dy = np.clip(iy_f - iy0, 0.0, 1.0)
-        dz = np.clip(iz_f - iz0, 0.0, 1.0)
+        gx = (x - ox) / res
+        gy = (y - oy) / res
+        gz = (z - oz) / res
 
-        if self._has_gradient:
-            interp = self._trilinear_interp(self._grid, ix0, iy0, iz0, dx, dy, dz)
-            dist = float(interp[0])
-            grad = np.array([interp[1], interp[2], interp[3]], dtype=float)
-            return (dist, grad)
-        else:
-            def _val(ix_f: float, iy_f: float, iz_f: float) -> float:
-                i0 = int(np.clip(np.floor(ix_f), 0, nx - 2))
-                j0 = int(np.clip(np.floor(iy_f), 0, ny - 2))
-                k0 = int(np.clip(np.floor(iz_f), 0, nz - 2))
-                dx0 = np.clip(ix_f - i0, 0.0, 1.0)
-                dy0 = np.clip(iy_f - j0, 0.0, 1.0)
-                dz0 = np.clip(iz_f - k0, 0.0, 1.0)
-                return float(self._trilinear_interp(self._grid, i0, j0, k0, dx0, dy0, dz0))
+        dist = self._sample_signed(gx, gy, gz)
+        grad_x = (self._sample_signed(gx + 1.0, gy, gz) - self._sample_signed(gx - 1.0, gy, gz)) * inv_res * 0.5
+        grad_y = (self._sample_signed(gx, gy + 1.0, gz) - self._sample_signed(gx, gy - 1.0, gz)) * inv_res * 0.5
+        grad_z = (self._sample_signed(gx, gy, gz + 1.0) - self._sample_signed(gx, gy, gz - 1.0)) * inv_res * 0.5
+        return (float(dist), np.array([grad_x, grad_y, grad_z], dtype=float))
 
-            dist = _val(ix_f, iy_f, iz_f)
-            grad_x = (_val(ix_f + 1, iy_f, iz_f) - _val(ix_f - 1, iy_f, iz_f)) * inv_res * 0.5
-            grad_y = (_val(ix_f, iy_f + 1, iz_f) - _val(ix_f, iy_f - 1, iz_f)) * inv_res * 0.5
-            grad_z = (_val(ix_f, iy_f, iz_f + 1) - _val(ix_f, iy_f, iz_f - 1)) * inv_res * 0.5
-            return (dist, np.array([grad_x, grad_y, grad_z], dtype=float))
+    def refresh(self) -> bool:
+        ok = self._refresh()
+        if ok and self.signed_sdf_enable and not self._signed_stats_logged and self._dist_grid is not None:
+            g = self._dist_grid
+            self._node.get_logger().info(
+                "Signed SDF ready: min=%.4f max=%.4f neg_voxels=%d"
+                % (float(np.min(g)), float(np.max(g)), int(np.sum(g < 0.0)))
+            )
+            self._signed_stats_logged = True
+        return ok
+
+    def query_trilinear_mpc(self, x: float, y: float, z: float) -> tuple[float, np.ndarray]:
+        if not self._ensure_ready() or self._dist_grid is None:
+            return (5.0, np.zeros(3))
+        return query_esdf_trilinear(
+            self._dist_grid,
+            tuple(self.origin),
+            float(self.resolution),
+            tuple(self.dims),
+            float(x),
+            float(y),
+            float(z),
+            has_gradient=False,
+        )
 
     def get_esdf(self, pos: Union[np.ndarray, list, tuple]) -> Union[float, np.ndarray]:
         pos = np.asarray(pos, dtype=float)
         if pos.ndim == 1:
             pos = pos.reshape(1, -1)
         n = pos.shape[0]
-        dists = np.full(n, 5.0)
+        dists = np.full(n, 5.0, dtype=float)
         for i in range(n):
             d, _ = self._trilinear(float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2]))
             dists[i] = d
@@ -323,194 +244,9 @@ class EsdfGridCache:
     ) -> bool:
         p1 = np.asarray(point1, dtype=float).flatten()[:3]
         p2 = np.asarray(point2, dtype=float).flatten()[:3]
-        for t in np.linspace(0, 1, num_samples):
+        for t in np.linspace(0.0, 1.0, num_samples):
             pt = p1 + t * (p2 - p1)
             d, _ = self._trilinear(float(pt[0]), float(pt[1]), float(pt[2]))
-            if d < safe_margin:
-                return True
-        return False
-
-    @property
-    def is_ready(self) -> bool:
-        """True if grid has been received and cache is valid."""
-        return self._ready
-
-
-class EsdfShmAdapter:
-    """
-    共享内存 ESDF 适配器。mmap 直接读取 FIESTA 导出的 /dev/shm/fiesta_esdf，
-    无 topic 序列化、无网络拷贝，查询延迟在微秒级。
-
-    要求: FIESTA 以 use_esdf_shm:=true 启动，且先于 Planner 运行一帧以完成首次导出。
-    """
-
-    def __init__(
-        self,
-        node: Node,
-        shm_name: str = "/fiesta_esdf",
-        frame_id: str = "map_origin",
-        map_origin_x: float = -5.0,
-        map_origin_y: float = -7.5,
-        map_origin_z: float = 0.0,
-        map_size_x: float = 22.0,
-        map_size_y: float = 17.0,
-        map_size_z: float = 6.0,
-        resolution: float = 0.15,
-    ) -> None:
-        self._node = node
-        self._shm_name = shm_name
-        self._frame_id = frame_id
-        self.origin = (map_origin_x, map_origin_y, map_origin_z)
-        self.resolution = float(resolution)
-        nx = max(1, int(round(map_size_x / resolution)))
-        ny = max(1, int(round(map_size_y / resolution)))
-        nz = max(1, int(round(map_size_z / resolution)))
-        self.dims = np.array([nx, ny, nz], dtype=int)
-        self._grid: Optional[np.ndarray] = None
-        self._mmap_handle = None
-        self._mmap_data = None
-        self._ready = False
-        self._refresh()
-
-        node.get_logger().info(
-            f"EsdfShmAdapter: use shared memory {shm_name} (zero-copy, no ROS topic)"
-        )
-
-    def _shm_path(self) -> str:
-        """Linux: /fiesta_esdf -> /dev/shm/fiesta_esdf"""
-        name = self._shm_name.lstrip("/") or "fiesta_esdf"
-        if sys.platform == "linux":
-            return f"/dev/shm/{name}"
-        return self._shm_name
-
-    def _refresh(self) -> bool:
-        """从共享内存刷新栅格。返回 True 表示成功。"""
-        path = self._shm_path()
-        if not os.path.exists(path):
-            return False
-        try:
-            with open(path, "rb") as f:
-                header = f.read(_SHM_HEADER_SIZE)
-            if len(header) < _SHM_HEADER_SIZE or header[:8] != _SHM_MAGIC:
-                return False
-            nx, ny, nz = struct.unpack("<III", header[8:20])
-            res, ox, oy, oz = struct.unpack("<dddd", header[20:52])
-            data_size = nx * ny * nz * 4 * 4  # 4 floats per voxel
-            with open(path, "rb") as f:
-                f.seek(_SHM_HEADER_SIZE)
-                data = np.frombuffer(f.read(data_size), dtype=np.float32)
-            if data.size != nx * ny * nz * 4:
-                return False
-            self._grid = data.reshape(nx, ny, nz, 4)
-            self.dims = np.array([nx, ny, nz], dtype=int)
-            self.origin = (ox, oy, oz)
-            self.resolution = float(res)
-            self._ready = True
-            return True
-        except (OSError, struct.error, ValueError):
-            return False
-
-    def _ensure_ready(self) -> bool:
-        """确保栅格有效，启动时可能需等待 FIESTA 首次导出。"""
-        if self._ready and self._grid is not None:
-            return True
-        return self._refresh()
-
-    def _trilinear(
-        self, x: float, y: float, z: float
-    ) -> tuple[float, np.ndarray]:
-        """三线性插值，返回 (dist, grad)。"""
-        if not self._ensure_ready() or self._grid is None:
-            return (5.0, np.zeros(3))
-        ox, oy, oz = self.origin
-        res = self.resolution
-        nx, ny, nz = self.dims
-        ix_f = (x - ox) / res
-        iy_f = (y - oy) / res
-        iz_f = (z - oz) / res
-        ix0 = int(np.clip(np.floor(ix_f), 0, nx - 2))
-        iy0 = int(np.clip(np.floor(iy_f), 0, ny - 2))
-        iz0 = int(np.clip(np.floor(iz_f), 0, nz - 2))
-        dx = np.clip(ix_f - ix0, 0.0, 1.0)
-        dy = np.clip(iy_f - iy0, 0.0, 1.0)
-        dz = np.clip(iz_f - iz0, 0.0, 1.0)
-        g = self._grid
-        v000 = g[ix0, iy0, iz0, :]
-        v001 = g[ix0, iy0, iz0 + 1, :]
-        v010 = g[ix0, iy0 + 1, iz0, :]
-        v011 = g[ix0, iy0 + 1, iz0 + 1, :]
-        v100 = g[ix0 + 1, iy0, iz0, :]
-        v101 = g[ix0 + 1, iy0, iz0 + 1, :]
-        v110 = g[ix0 + 1, iy0 + 1, iz0, :]
-        v111 = g[ix0 + 1, iy0 + 1, iz0 + 1, :]
-        c00 = v000 * (1 - dz) + v001 * dz
-        c01 = v010 * (1 - dz) + v011 * dz
-        c10 = v100 * (1 - dz) + v101 * dz
-        c11 = v110 * (1 - dz) + v111 * dz
-        c0 = c00 * (1 - dy) + c01 * dy
-        c1 = c10 * (1 - dy) + c11 * dy
-        interp = c0 * (1 - dx) + c1 * dx
-        return (float(interp[0]), np.array(interp[1:4], dtype=float))
-
-    def refresh(self) -> bool:
-        """主动刷新共享内存内容（规划前调用以获取最新 ESDF）。"""
-        return self._refresh()
-
-    def query_trilinear_mpc(self, x: float, y: float, z: float) -> tuple[float, np.ndarray]:
-        """
-        供 MPC 控制专用的三线性插值，获取无人机位置的精确 ESDF 值与梯度。
-        采用显式权重形式。
-        """
-        if not self._ensure_ready() or self._grid is None:
-            return (5.0, np.zeros(3))
-        from .trilinear_esdf import query_esdf_trilinear
-        return query_esdf_trilinear(
-            self._grid,
-            tuple(self.origin),
-            float(self.resolution),
-            tuple(self.dims),
-            float(x), float(y), float(z),
-            has_gradient=True,
-        )
-
-    def get_esdf(self, pos: Union[np.ndarray, list, tuple]) -> Union[float, np.ndarray]:
-        pos = np.asarray(pos, dtype=float)
-        if pos.ndim == 1:
-            pos = pos.reshape(1, -1)
-        n = pos.shape[0]
-        dists = np.full(n, 5.0)
-        for i in range(n):
-            d, _ = self._trilinear(
-                float(pos[i, 0]), float(pos[i, 1]), float(pos[i, 2])
-            )
-            dists[i] = d
-        return float(dists[0]) if n == 1 else dists
-
-    def compute_gradient(
-        self, pos: Union[np.ndarray, list, tuple]
-    ) -> Optional[np.ndarray]:
-        pos = np.asarray(pos, dtype=float).flatten()
-        if len(pos) < 3:
-            return None
-        _, grad = self._trilinear(
-            float(pos[0]), float(pos[1]), float(pos[2])
-        )
-        return grad
-
-    def is_collision_line_segment(
-        self,
-        point1: Union[np.ndarray, list, tuple],
-        point2: Union[np.ndarray, list, tuple],
-        safe_margin: float = 0.2,
-        num_samples: int = 10,
-    ) -> bool:
-        p1 = np.asarray(point1, dtype=float).flatten()[:3]
-        p2 = np.asarray(point2, dtype=float).flatten()[:3]
-        for t in np.linspace(0, 1, num_samples):
-            pt = p1 + t * (p2 - p1)
-            d, _ = self._trilinear(
-                float(pt[0]), float(pt[1]), float(pt[2])
-            )
             if d < safe_margin:
                 return True
         return False

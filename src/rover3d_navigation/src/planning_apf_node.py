@@ -12,7 +12,7 @@ import numpy as np
 import rclpy
 from navigation_msgs.msg import GMM
 from rover3d_navigation.ROVER_3D import PlanningAPFProcess
-from rover3d_navigation.esdf_adapter import EsdfMapAdapter, EsdfGridCache, EsdfShmAdapter
+from rover3d_navigation.esdf_adapter import EsdfShmAdapter
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
@@ -35,12 +35,14 @@ class PlanningAPFNode(Node):
         self.declare_parameter("control_rate", 5.0)
         self.declare_parameter("max_apf_try", 10)
         self.declare_parameter("gmm_interp_steps", 5)
+        self.declare_parameter("apf_goal_lock_radius", 0.25)
+        self.declare_parameter("slp_epsilon", 0.2)
         self.declare_parameter("use_gmm_trajectory_slp", True)
-        self.declare_parameter("esdf_service", "esdf/query")
-        self.declare_parameter("esdf_grid_topic", "/esdf/grid_full")
-        self.declare_parameter("use_esdf_grid_cache", True)
-        self.declare_parameter("esdf_mode", "grid_cache")  # grid_cache | shm | service
+        self.declare_parameter("esdf_mode", "shm")
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
+        self.declare_parameter("signed_sdf_enable", True)
+        self.declare_parameter("signed_sdf_occupied_eps", 1e-6)
+        self.declare_parameter("signed_sdf_inside_offset_vox", 0.5)
         self.declare_parameter("esdf_frame_id", "map_origin")
         self.declare_parameter("map_origin_x", -5.0)
         self.declare_parameter("map_origin_y", -7.5)
@@ -61,6 +63,10 @@ class PlanningAPFNode(Node):
         self._control_rate = float(self.get_parameter("control_rate").value)
         self._max_apf_try = int(self.get_parameter("max_apf_try").value)
         self._gmm_interp_steps = int(self.get_parameter("gmm_interp_steps").value)
+        self._apf_goal_lock_radius = float(
+            self.get_parameter("apf_goal_lock_radius").value
+        )
+        self._slp_epsilon = float(self.get_parameter("slp_epsilon").value)
         self._use_gmm_trajectory_slp = bool(
             self.get_parameter("use_gmm_trajectory_slp").value
         )
@@ -111,45 +117,27 @@ class PlanningAPFNode(Node):
             )
 
         esdf_mode = str(self.get_parameter("esdf_mode").value).lower()
-        if esdf_mode == "shm":
-            self._esdf = EsdfShmAdapter(
-                self,
-                shm_name=str(self.get_parameter("esdf_shm_name").value),
-                frame_id=self.get_parameter("esdf_frame_id").value,
-                map_origin_x=float(self.get_parameter("map_origin_x").value),
-                map_origin_y=float(self.get_parameter("map_origin_y").value),
-                map_origin_z=float(self.get_parameter("map_origin_z").value),
-                map_size_x=float(self.get_parameter("map_size_x").value),
-                map_size_y=float(self.get_parameter("map_size_y").value),
-                map_size_z=float(self.get_parameter("map_size_z").value),
-                resolution=float(self.get_parameter("esdf_resolution").value),
+        if esdf_mode != "shm":
+            self.get_logger().warn(
+                f"esdf_mode={esdf_mode} 已弃用，当前仅支持 shm，自动回退到 shm"
             )
-        elif esdf_mode == "grid_cache" or self.get_parameter("use_esdf_grid_cache").value:
-            self._esdf = EsdfGridCache(
-                self,
-                grid_topic=str(self.get_parameter("esdf_grid_topic").value),
-                frame_id=self.get_parameter("esdf_frame_id").value,
-                map_origin_x=float(self.get_parameter("map_origin_x").value),
-                map_origin_y=float(self.get_parameter("map_origin_y").value),
-                map_origin_z=float(self.get_parameter("map_origin_z").value),
-                map_size_x=float(self.get_parameter("map_size_x").value),
-                map_size_y=float(self.get_parameter("map_size_y").value),
-                map_size_z=float(self.get_parameter("map_size_z").value),
-                resolution=float(self.get_parameter("esdf_resolution").value),
-            )
-        else:
-            self._esdf = EsdfMapAdapter(
-                self,
-                service_name=self.get_parameter("esdf_service").value,
-                frame_id=self.get_parameter("esdf_frame_id").value,
-                map_origin_x=float(self.get_parameter("map_origin_x").value),
-                map_origin_y=float(self.get_parameter("map_origin_y").value),
-                map_origin_z=float(self.get_parameter("map_origin_z").value),
-                map_size_x=float(self.get_parameter("map_size_x").value),
-                map_size_y=float(self.get_parameter("map_size_y").value),
-                map_size_z=float(self.get_parameter("map_size_z").value),
-                resolution=float(self.get_parameter("esdf_resolution").value),
-            )
+        self._esdf = EsdfShmAdapter(
+            self,
+            shm_name=str(self.get_parameter("esdf_shm_name").value),
+            frame_id=self.get_parameter("esdf_frame_id").value,
+            map_origin_x=float(self.get_parameter("map_origin_x").value),
+            map_origin_y=float(self.get_parameter("map_origin_y").value),
+            map_origin_z=float(self.get_parameter("map_origin_z").value),
+            map_size_x=float(self.get_parameter("map_size_x").value),
+            map_size_y=float(self.get_parameter("map_size_y").value),
+            map_size_z=float(self.get_parameter("map_size_z").value),
+            resolution=float(self.get_parameter("esdf_resolution").value),
+            signed_sdf_enable=bool(self.get_parameter("signed_sdf_enable").value),
+            signed_sdf_occupied_eps=float(self.get_parameter("signed_sdf_occupied_eps").value),
+            signed_sdf_inside_offset_vox=float(
+                self.get_parameter("signed_sdf_inside_offset_vox").value
+            ),
+        )
 
         self.create_timer(1.0 / self._control_rate, self._control_loop)
         self.get_logger().info(
@@ -182,6 +170,9 @@ class PlanningAPFNode(Node):
         self._gmm_goal = (means, covs, weights)
         self._planning_process = None
         self.get_logger().info(f"New GMM goal: {n} components")
+        self.get_logger().info(
+            f"Raw goal means={means}, weights={weights}"
+        )
 
     def _get_robots_positions(self) -> Optional[np.ndarray]:
         positions = []
@@ -253,6 +244,8 @@ class PlanningAPFNode(Node):
                 goal_weights=weights,
                 gmm_interp_steps=self._gmm_interp_steps,
                 max_apf_try=self._max_apf_try,
+                apf_goal_lock_radius=self._apf_goal_lock_radius,
+                slp_epsilon=self._slp_epsilon,
                 use_gmm_trajectory_slp=self._use_gmm_trajectory_slp,
                 config_dir=self._config_dir,
             )

@@ -5,12 +5,16 @@ import numpy as np
 
 
 def _find_mean_index(means_list, mean):
-    """容差匹配：在 means_list 中查找与 mean 最接近的索引，避免 list.index 的浮点精度问题。"""
+    """容差匹配优先；若无精确匹配则回退到最近 GC 节点。"""
     arr = np.asarray(mean).flatten()[:3]
     for i, m in enumerate(means_list):
         if np.allclose(np.asarray(m).flatten()[:3], arr):
             return i
-    raise ValueError(f"Mean {list(arr)} not found in means_list (len={len(means_list)})")
+    if len(means_list) == 0:
+        raise ValueError("means_list is empty")
+    means_arr = np.asarray([np.asarray(m).flatten()[:3] for m in means_list], dtype=float)
+    dists = np.linalg.norm(means_arr - arr, axis=1)
+    return int(np.argmin(dists))
 
 
 # 供 Planning_3D 等模块使用（与 _find_mean_index 相同）
@@ -119,6 +123,7 @@ def notgreedy_genPathTable(
 
     collision_cache: Dict[Tuple[Tuple[float, float, float], Tuple[float, float, float]], bool] = {}
     rows: List[List[float]] = []
+    target_gc_indices = [_find_mean_index(conbinedmeans_list, mu) for mu in fmeans]
 
     for i in range(len(current_means)):
         current_mu = current_means[i]
@@ -160,9 +165,16 @@ def notgreedy_genPathTable(
                 if gdist != gdist:  # NaN：图上不可达，不生成路径
                     continue
 
-                total = lag1 + lag2 + w_tf * gdist
                 for j in range(len(fmeans)):
-                    rows.append([i, n, m, j, lag1, lag2, gdist, total])
+                    t = int(target_gc_indices[j])
+                    gdist_mt = float(Graph_GC.get(m, {}).get(t, float("nan")))
+                    if gdist_mt != gdist_mt:  # NaN：m 到目标不可达
+                        continue
+                    d_mt = float(W[m, t])
+                    lag3 = 0.0 if d_mt < 1e-8 else float(d_mt ** w2_cost_power)
+                    gdist_total = gdist + gdist_mt
+                    total = lag1 + lag2 + lag3 + w_tf * gdist_total
+                    rows.append([i, n, m, j, lag1, lag2, gdist_total, total])
 
     if not rows:
         return np.zeros((0, 8), dtype=float)

@@ -13,8 +13,21 @@ except ImportError:
 import math
 import pandas as pd
 import time
+import warnings
 from qpsolvers import solve_qp
+from sklearn.mixture import GaussianMixture
 
+warnings.filterwarnings("ignore")
+
+
+
+def _to_pruned_csc(mat: np.ndarray, zero_eps: float = 1e-9) -> scipy.sparse.csc_matrix:
+    """将近零元素裁剪后转为 CSC，避免 MOSEK 的 zeros-in-sparse-col 警告刷屏。"""
+    arr = np.asarray(mat, dtype=float).copy()
+    arr[np.abs(arr) < zero_eps] = 0.0
+    sp = scipy.sparse.csc_matrix(arr)
+    sp.eliminate_zeros()
+    return sp
 
 
 def build_weight_map(path_table, node_indices, col_id, num_variable):
@@ -80,6 +93,7 @@ def Optimization_SLP(
     Graph_GC,
     Wasserstein_table,
     Node_PDF_table,
+    robots_positions,
     epsilon=0.2,
     min_weight=0.002,
     tau=1e-3,
@@ -102,9 +116,32 @@ def Optimization_SLP(
 
     print("[0] 开始 Optimization_SLP")
 
-    current_means = np.asarray(current_means, dtype=float)
-    current_covs = np.asarray(current_covs, dtype=float)
-    current_weights = _normalize_weights(current_weights)
+    # --------------------------------------------------------
+    # Step 0: 基于当前 global/odom 的集群位置做 EM 拟合
+    # --------------------------------------------------------
+    robots_positions = np.asarray(robots_positions, dtype=float).reshape(-1, 3)
+    if robots_positions.shape[0] == 0:
+        raise ValueError("robots_positions 为空，无法进行 STEP0-EM")
+
+    current_means_in = np.asarray(current_means, dtype=float).reshape(-1, 3)
+    k_hint = int(current_means_in.shape[0])
+    k = max(1, min(k_hint, robots_positions.shape[0]))
+
+    em = GaussianMixture(
+        n_components=k,
+        covariance_type="full",
+        reg_covar=1e-6,
+        random_state=0,
+    )
+    em.fit(robots_positions)
+
+    current_means = np.asarray(em.means_, dtype=float)
+    current_covs = np.asarray(em.covariances_, dtype=float)
+    current_weights = _normalize_weights(em.weights_)
+    print(
+        f"[0] STEP0-EM done: samples={robots_positions.shape[0]}, "
+        f"K={k}, weights={current_weights.tolist()}"
+    )
 
     fmeans = np.asarray(fmeans, dtype=float)
     fcovs = np.asarray(fcovs, dtype=float)
@@ -118,10 +155,23 @@ def Optimization_SLP(
     print(current_means)
     print(current_covs)
     print(current_weights)
+    print(f"[0] target fmeans = {fmeans.tolist() if hasattr(fmeans, 'tolist') else fmeans}")
+    print(f"[0] target fweights = {fweights.tolist() if hasattr(fweights, 'tolist') else fweights}")
+    print(f"[0] slp epsilon = {epsilon}")
 
     # --------------------------------------------------------
     # Step 1: 当前 GMM 的 ESDF-CVaR 安全检查
     # --------------------------------------------------------
+    try:
+        phi_now = np.asarray(esdf_map.get_esdf(current_means), dtype=float).reshape(-1)
+        neg_cnt = int(np.sum(phi_now < 0.0))
+        print(
+            f"[1] signed_sdf stats: min={float(np.min(phi_now)):.6f}, "
+            f"max={float(np.max(phi_now)):.6f}, neg_count={neg_cnt}/{len(phi_now)}"
+        )
+    except Exception as ex:
+        print(f"[1] signed_sdf stats unavailable: {ex}")
+
     CVaR_curr = compute_cvar_from_esdf(
         current_means=current_means,
         current_covs=current_covs,
@@ -181,7 +231,7 @@ def Optimization_SLP(
     print(f"[4] 路径表完成，耗时 {time.time() - start:.2f}s")
 
     if path_table.shape[0] == 0:
-        print("[4] 警告：路径表为空（无可达路径），回退为直达目标")
+        print("[4] 路径表为空（无可达路径），回退为直达目标")
         _, W, _ = control_law_3D.calWGMetric_speedUp(
             current_means, current_covs, current_weights,
             fmeans, fcovs, fweights
@@ -239,6 +289,15 @@ def Optimization_SLP(
             Wa = _normalize_weights(Wa)
         if np.sum(Wak2) > 0:
             Wak2 = _normalize_weights(Wak2)
+
+        if np.sum(Wa) > 0:
+            macro_idx_local = int(np.argmax(Wa))
+            macro_idx_global = int(index_next_gc[macro_idx_local])
+            macro_point = np.asarray(next_means[macro_idx_local]).tolist()
+            print(
+                f"[SLP] step={iter_count}, macro_node={macro_idx_global}, "
+                f"macro_point={macro_point}, weight={Wa[macro_idx_local]:.6f}"
+            )
 
         # ----------------------------------------------------
         # 风险约束线性化
@@ -361,17 +420,24 @@ def Optimization_SLP(
         # 解 QP
         # ----------------------------------------------------
         time1 = time.time()
+        solver_kwargs = {}
+        if qp_solver == "mosek":
+            solver_kwargs["mosek_params"] = {
+                "MSK_IPAR_LOG": 0,
+                "MSK_IPAR_MAX_NUM_WARNINGS": 0,
+            }
         solution = solve_qp(
-            P=scipy.sparse.csc_matrix(H),
+            P=_to_pruned_csc(H),
             q=q,
-            G=scipy.sparse.csc_matrix(A),
+            G=_to_pruned_csc(A),
             h=b,
-            A=scipy.sparse.csc_matrix(Aeq) if Aeq.size > 0 else None,
+            A=_to_pruned_csc(Aeq) if Aeq.size > 0 else None,
             b=beq if beq.size > 0 else None,
             lb=np.zeros(numVariable),
             ub=np.ones(numVariable),
             solver=qp_solver,
             verbose=False,
+            **solver_kwargs,
         )
 
         if solution is None:
