@@ -15,8 +15,7 @@ install(DIRECTORY launch config
 
 # Node executables from src/
 install(PROGRAMS
-  src/navigator.py
-  src/planning_apf_node.py
+  src/planning_node.py
   scripts/publish_gmm_goal.py
   scripts/precompute_config_prior.py
   DESTINATION lib/${PROJECT_NAME}

@@ -2,7 +2,7 @@
 """
 预计算 rover3d_navigation 的 config 先验文件。
 
-根据 FIESTA 的地图配置（lx, ly, lz, rx, ry, rz）生成纯离散 GC 节点图，不包含目标点。
+根据地图配置生成纯离散 GC 节点图，不包含目标点。
 发布的目标点将在运行时自动归并到最近的离散 GC 节点。
 
 输出：GC_means_3D.json、GC_covs_3D.json、Wasserstein_table_3D.npy、
@@ -18,18 +18,24 @@
 
 可选参数:
   --fiesta-config  FIESTA fiesta.yaml 路径
+  --planning-config planning.yaml 路径（默认优先使用）
+  --map-source     地图参数来源：auto/planning/fiesta
   --output         输出目录
-  --grid-step      GC 节点网格步长 (默认 2.0，需与 planning_apf.yaml 一致)
+  --grid-step      GC 节点网格步长 (默认 2.0，需与 planning.yaml 一致)
+  --graph-grid-res 构图体素分辨率（默认取 esdf_resolution）
+  --interp-step    GMM 插值步长（默认与 graph-grid-res 相同）
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
 import numpy as np
+import scipy
 from scipy.stats import multivariate_normal
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +49,11 @@ try:
 except ImportError:
     yaml = None
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable):
+        return iterable
 
 def load_yaml(path: str) -> dict:
     if yaml is None:
@@ -55,11 +66,11 @@ def get_map_params_from_fiesta(fiesta_config_path: str) -> dict:
     """从 FIESTA fiesta.yaml 读取地图参数 (lx, ly, lz, rx, ry, rz)。"""
     data = load_yaml(fiesta_config_path)
     params = data.get("fiesta_node", {}).get("ros__parameters", data)
-    lx = float(params.get("lx", -5.0))
-    ly = float(params.get("ly", -7.5))
+    lx = float(params.get("lx", -30.0))
+    ly = float(params.get("ly", -30.0))
     lz = float(params.get("lz", 0.0))
-    rx = float(params.get("rx", 17.0))
-    ry = float(params.get("ry", 9.5))
+    rx = float(params.get("rx", 30.0))
+    ry = float(params.get("ry", 30.0))
     rz = float(params.get("rz", 6.0))
     return {
         "map_origin_x": lx,
@@ -68,7 +79,153 @@ def get_map_params_from_fiesta(fiesta_config_path: str) -> dict:
         "map_size_x": rx - lx,
         "map_size_y": ry - ly,
         "map_size_z": rz - lz,
+        "esdf_resolution": float(params.get("resolution", 0.2)),
     }
+
+
+def get_map_params_from_planning(planning_config_path: str) -> dict:
+    """从 planning.yaml 读取地图参数（map_origin/map_size/esdf_resolution）。"""
+    data = load_yaml(planning_config_path)
+    params = data.get("planning_node", {}).get("ros__parameters", data)
+    return {
+        "map_origin_x": float(params.get("map_origin_x", -5.0)),
+        "map_origin_y": float(params.get("map_origin_y", -7.5)),
+        "map_origin_z": float(params.get("map_origin_z", 0.0)),
+        "map_size_x": float(params.get("map_size_x", 22.0)),
+        "map_size_y": float(params.get("map_size_y", 17.0)),
+        "map_size_z": float(params.get("map_size_z", 6.0)),
+        "esdf_resolution": float(params.get("esdf_resolution", 0.2)),
+    }
+
+
+def Wasserstein_distance(mean1, cov1, mean2, cov2):
+    """Wasserstein-2 distance between two Gaussian components."""
+    mean1 = np.asarray(mean1, dtype=float)
+    mean2 = np.asarray(mean2, dtype=float)
+    cov1 = np.asarray(cov1, dtype=float)
+    cov2 = np.asarray(cov2, dtype=float)
+    add1 = np.linalg.norm(mean1 - mean2)
+    if np.array_equal(cov1, cov2):
+        return float(add1)
+    s0 = scipy.linalg.sqrtm(cov1)
+    add2 = np.trace(cov1 + cov2 - 2 * scipy.linalg.sqrtm(s0 @ cov2 @ s0))
+    return float((add1 ** 2 + add2) ** 0.5)
+
+
+def interpGC_speedUp(mean1, cov1, mean2, cov2, gridXYZ, delDist):
+    d = Wasserstein_distance(mean1, cov1, mean2, cov2)
+    mean1 = np.array(mean1)
+    cov1 = np.array(cov1)
+    mean2 = np.array(mean2)
+    cov2 = np.array(cov2)
+    numPoint = math.ceil(d / delDist)
+
+    if numPoint <= 1:
+        PDF = multivariate_normal.pdf(gridXYZ, mean=mean2, cov=cov2).astype(np.float32)
+        PDF_Vectors = (PDF.reshape(-1, 1) * 0.1 ** 3).astype(np.float32)
+        return PDF_Vectors, []
+
+    t = np.linspace(0, 1, numPoint + 1)[1:]
+    N = gridXYZ.shape[0]
+    PDF_Vectors = np.zeros((N, numPoint), dtype=np.float32)
+    Dist_sq_Vector = np.full(numPoint, delDist ** 2, dtype=np.float32)
+
+    cov_equal = np.array_equal(cov1, cov2)
+    if not cov_equal:
+        Sigma0_sqrt = scipy.linalg.sqrtm(cov1)
+        temp_common = scipy.linalg.sqrtm(Sigma0_sqrt @ cov2 @ Sigma0_sqrt)
+        Sigma0_sqrt_inv = np.linalg.inv(Sigma0_sqrt)
+
+    for i in range(numPoint):
+        t_i = t[i]
+        mu = (1 - t_i) * mean1 + t_i * mean2
+        if not cov_equal:
+            Sigma = Sigma0_sqrt_inv @ ((1 - t_i) * cov2 + t_i * temp_common) @ Sigma0_sqrt_inv
+        else:
+            Sigma = cov1
+        PDF = multivariate_normal.pdf(gridXYZ, mean=mu, cov=Sigma).astype(np.float32)
+        PDF_Vectors[:, i] = PDF * (0.1 ** 3)
+
+    return PDF_Vectors, Dist_sq_Vector
+
+
+def init_Graph_GC(
+    conbinedmeans_list,
+    conbinedcovs_list,
+    Wasserstein_table,
+    xa=0,
+    ya=0,
+    za=0,
+    xb=20,
+    yb=16,
+    zb=2,
+    graph_grid_res=0.2,
+    delDist=0.2,
+    edge_w_max=2.0,
+):
+    print("Start to create the graph...")
+    dx = dy = dz = graph_grid_res
+    numGridX = int((xb - xa) / dx + 1)
+    numGridY = int((yb - ya) / dy + 1)
+    numGridZ = int((zb - za) / dz + 1)
+    numGrid = numGridX * numGridY * numGridZ
+    xGrid = np.linspace(xa, xb, numGridX)
+    yGrid = np.linspace(ya, yb, numGridY)
+    zGrid = np.linspace(za, zb, numGridZ)
+
+    gridX, gridY, gridZ = np.meshgrid(xGrid, yGrid, zGrid, indexing="ij")
+    gridX = np.round(gridX, decimals=1)
+    gridY = np.round(gridY, decimals=1)
+    gridZ = np.round(gridZ, decimals=1)
+    gridXYZ = np.column_stack(
+        (gridX.flatten(order="F"), gridY.flatten(order="F"), gridZ.flatten(order="F"))
+    )
+
+    D_stack = []
+    total_edges = 0
+    n_nodes = len(conbinedmeans_list)
+    for i in tqdm(range(n_nodes)):
+        mu_i = conbinedmeans_list[i]
+        Sigma_i = conbinedcovs_list[i]
+        D = np.zeros((1, n_nodes))
+        edge_pdf_columns = []
+        edge_indices = []
+        for j in range(n_nodes):
+            mu_j = conbinedmeans_list[j]
+            Sigma_j = conbinedcovs_list[j]
+            d = Wasserstein_table[i, j]
+            idx = j * n_nodes + i
+            if 0 <= d <= edge_w_max:
+                l_sq = math.ceil(d / delDist) * (delDist ** 2)
+                D[:, j] = l_sq
+                PDF_vector, _ = interpGC_speedUp(mu_i, Sigma_i, mu_j, Sigma_j, gridXYZ, delDist)
+                PDF_vector = np.sum(PDF_vector, axis=1)
+                edge_pdf_columns.append(PDF_vector.astype(np.float32, copy=False))
+                edge_indices.append(idx)
+        D_stack.append(D)
+        # 按边逐列累积，避免为所有节点预分配 (numGrid, n_nodes) 超大矩阵。
+        if edge_pdf_columns:
+            _pdf_cols_i = np.column_stack(edge_pdf_columns)
+            _edge_idx_i = np.asarray(edge_indices, dtype=np.int64)
+            total_edges += int(_edge_idx_i.size)
+            del _pdf_cols_i, _edge_idx_i
+        del edge_pdf_columns, edge_indices
+    D = np.array(D_stack).reshape(n_nodes, n_nodes)
+    print(f"Graph edges kept: {total_edges}")
+    GraphA = D
+    return GraphA
+
+
+def init_GC_Nodes(mean_table, grid_step):
+    GC_means = []
+    GC_covs = []
+    sigma_diag = float(grid_step) / 2.0
+    for i in range(len(mean_table)):
+        mu = mean_table[i]
+        Sigma = [[sigma_diag, 0, 0], [0, sigma_diag, 0], [0, 0, sigma_diag]]
+        GC_means.append(mu)
+        GC_covs.append(Sigma)
+    return GC_means, GC_covs
 
 
 def main() -> None:
@@ -87,6 +244,20 @@ def main() -> None:
         default=_fiesta_default,
         help="FIESTA fiesta.yaml 路径",
     )
+    _planning_default = os.path.join(_pkg_root, "config", "planning.yaml")
+    if not os.path.isfile(_planning_default):
+        _planning_default = os.path.join(_cwd, "src", "rover3d_navigation", "config", "planning.yaml")
+    parser.add_argument(
+        "--planning-config",
+        default=_planning_default,
+        help="planning.yaml 路径（默认优先读取地图参数）",
+    )
+    parser.add_argument(
+        "--map-source",
+        choices=["auto", "planning", "fiesta"],
+        default="auto",
+        help="地图参数来源：auto(优先 planning)->fiesta",
+    )
     _out_default = os.path.join(_pkg_root, "config")
     if not os.path.isdir(_out_default):
         _out_default = os.path.join(_cwd, "src", "rover3d_navigation", "config")
@@ -101,6 +272,18 @@ def main() -> None:
         default=2.0,
         help="GC 节点网格步长 [m]（须与生成 config 时所用步长一致）",
     )
+    parser.add_argument(
+        "--graph-grid-res",
+        type=float,
+        default=None,
+        help="构图体素分辨率 [m]（默认取 esdf_resolution）",
+    )
+    parser.add_argument(
+        "--interp-step",
+        type=float,
+        default=None,
+        help="GC 插值步长 [m]（默认与 graph-grid-res 一致）",
+    )
     args = parser.parse_args()
 
     # 规范化路径（支持脚本从任意目录运行）
@@ -110,36 +293,80 @@ def main() -> None:
         return os.path.normpath(p)
 
     fiesta_path = _norm(args.fiesta_config)
+    planning_path = _norm(args.planning_config)
     output_dir = _norm(args.output)
     grid_step = args.grid_step
 
-    if not os.path.exists(fiesta_path):
-        print(f"错误: FIESTA 配置不存在: {fiesta_path}")
+    if grid_step <= 0:
+        print("错误: --grid-step 必须 > 0")
         sys.exit(1)
+
+    planning_exists = os.path.exists(planning_path)
+    fiesta_exists = os.path.exists(fiesta_path)
+    if args.map_source == "planning":
+        if not planning_exists:
+            print(f"错误: planning 配置不存在: {planning_path}")
+            sys.exit(1)
+        map_p = get_map_params_from_planning(planning_path)
+        map_source = "planning"
+    elif args.map_source == "fiesta":
+        if not fiesta_exists:
+            print(f"错误: FIESTA 配置不存在: {fiesta_path}")
+            sys.exit(1)
+        map_p = get_map_params_from_fiesta(fiesta_path)
+        map_source = "fiesta"
+    else:
+        if planning_exists:
+            map_p = get_map_params_from_planning(planning_path)
+            map_source = "planning(auto)"
+        elif fiesta_exists:
+            map_p = get_map_params_from_fiesta(fiesta_path)
+            map_source = "fiesta(auto-fallback)"
+        else:
+            print("错误: planning 与 FIESTA 配置均不存在")
+            print(f"  planning: {planning_path}")
+            print(f"  fiesta  : {fiesta_path}")
+            sys.exit(1)
+
+    graph_grid_res = (
+        float(args.graph_grid_res)
+        if args.graph_grid_res is not None
+        else float(map_p.get("esdf_resolution", 0.2))
+    )
+    interp_step = (
+        float(args.interp_step)
+        if args.interp_step is not None
+        else graph_grid_res
+    )
+    if graph_grid_res <= 0 or interp_step <= 0:
+        print("错误: --graph-grid-res 和 --interp-step 必须 > 0")
+        sys.exit(1)
+
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. 从 FIESTA 配置读取地图参数
-    map_p = get_map_params_from_fiesta(fiesta_path)
+    # 1. 读取地图参数
     xa = map_p["map_origin_x"]
     ya = map_p["map_origin_y"]
     za = map_p["map_origin_z"]
     xb = xa + map_p["map_size_x"]
     yb = ya + map_p["map_size_y"]
     zb = za + map_p["map_size_z"]
+    print(f"地图参数来源: {map_source}")
     print(f"地图边界: x=[{xa}, {xb}], y=[{ya}, {yb}], z=[{za}, {zb}]")
-
-    # 2. 生成离散 GC 节点（不包含目标点，目标在运行时归并到最近 GC）
-    from rover3d_navigation import init_Graph_CVaR_3D
+    print(f"构图分辨率: {graph_grid_res}, 插值步长: {interp_step}, GC步长: {grid_step}")
 
     mean_table = []
+    center_offset = grid_step / 2.0
     for i in np.arange(xa, xb, grid_step):
         for j in np.arange(ya, yb, grid_step):
             for k in np.arange(za, zb, grid_step):
-                mean_table.append([float(i + 0.5), float(j + 0.5), float(k + 0.5)])
+                mean_table.append(
+                    [float(i + center_offset), float(j + center_offset), float(k + center_offset)]
+                )
     if len(mean_table) == 0:
         mean_table = [[(xa + xb) / 2, (ya + yb) / 2, (za + zb) / 2]]
 
-    GC_means, GC_covs = init_Graph_CVaR_3D.init_GC_Nodes(mean_table)
+    GC_means, GC_covs = init_GC_Nodes(mean_table, grid_step)
     print(f"GC 节点数: {len(GC_means)} （纯离散节点，不含目标点）")
 
     # 3. 使用 GC 节点构建图（目标点运行时归并到最近 GC）
@@ -153,8 +380,6 @@ def main() -> None:
     print(f"总节点数: {Numnode}")
 
     # 4. 计算 Wasserstein 与 Node_PDF 表
-    from rover3d_navigation import control_law_3D
-
     print("计算 Wasserstein 与 Node_PDF 表...")
     Wasserstein_table = np.zeros((Numnode, Numnode))
     Node_PDF_table = np.zeros((Numnode, Numnode))
@@ -168,16 +393,18 @@ def main() -> None:
             c2 = conbinedcovs_list[j]
             if not hasattr(c2, "shape"):
                 c2 = np.array(c2).reshape(3, 3)
-            Wasserstein_table[i, j] = control_law_3D.Wasserstein_distance(m1, c1, m2, c2)
+            Wasserstein_table[i, j] = Wasserstein_distance(m1, c1, m2, c2)
             Node_PDF_table[i, j] = multivariate_normal.pdf(
                 m1, mean=np.array(m2), cov=c2
             )
 
     # 5. 构建 Graph_GC（邻接矩阵）
     print("构建 Graph_GC...")
-    Graph_adj = init_Graph_CVaR_3D.init_Graph_GC(
+    Graph_adj = init_Graph_GC(
         conbinedmeans_list, conbinedcovs_list, Wasserstein_table,
         xa=xa, ya=ya, za=za, xb=xb, yb=yb, zb=zb,
+        graph_grid_res=graph_grid_res,
+        delDist=interp_step,
     )
 
     # 6. 保存

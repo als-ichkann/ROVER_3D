@@ -24,6 +24,9 @@ def _launch_setup(context, *args, **kwargs):
             "voxel_leaf_size": 0.1,
             "filter_high_intensity": True,
             "intensity_max_threshold": 1000.0,
+            "filter_body_points": True,
+            "body_frame": "base_link",
+            "body_filter_radius": 0.45,
 
             "combined_map_topic": "/global_downsampled_map",
             "origin_frame": "map_origin",

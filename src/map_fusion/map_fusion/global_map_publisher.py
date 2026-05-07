@@ -48,6 +48,9 @@ class MapFusionNode(Node):
         self.declare_parameter('voxel_leaf_size', 0.1)
         self.declare_parameter('filter_high_intensity', True)
         self.declare_parameter('intensity_max_threshold', 1000.0)
+        self.declare_parameter('filter_body_points', True)
+        self.declare_parameter('body_frame', 'base_link')
+        self.declare_parameter('body_filter_radius', 0.45)
         self.declare_parameter('debug_profile', True)
         self.declare_parameter('debug_profile_every', 10)
 
@@ -60,6 +63,9 @@ class MapFusionNode(Node):
         self.voxel_size: float = float(self.get_parameter('voxel_leaf_size').value)
         self.filter_high_intensity: bool = bool(self.get_parameter('filter_high_intensity').value)
         self.intensity_max_threshold: float = float(self.get_parameter('intensity_max_threshold').value)
+        self.filter_body_points: bool = bool(self.get_parameter('filter_body_points').value)
+        self.body_frame: str = str(self.get_parameter('body_frame').value).lstrip('/')
+        self.body_filter_radius: float = max(0.0, float(self.get_parameter('body_filter_radius').value))
         self.debug_profile: bool = bool(self.get_parameter('debug_profile').value)
         self.debug_profile_every: int = int(self.get_parameter('debug_profile_every').value)
         self._profile_count: int = 0
@@ -113,7 +119,9 @@ class MapFusionNode(Node):
             f"global_map_node TF-fusion started. global_frame={self.origin_frame_id}, "
             f"combined_map_topic={self.combined_map_topic}, tf children=/{self.bot_prefix}<id>/{self.bot_cloud_frame}, "
             f"cloud_topic=/{self.bot_prefix}<id>/{self.bot_cloud_topic}, voxel_size={self.voxel_size}, "
-            f"filter_high_intensity={self.filter_high_intensity}, intensity_max_threshold={self.intensity_max_threshold}"
+            f"filter_high_intensity={self.filter_high_intensity}, intensity_max_threshold={self.intensity_max_threshold}, "
+            f"filter_body_points={self.filter_body_points}, body_frame={self.body_frame}, "
+            f"body_filter_radius={self.body_filter_radius}"
         )
 
     def _register_bot(self, bot_id: int | None) -> None:
@@ -181,11 +189,42 @@ class MapFusionNode(Node):
         trans = np.array([t.x, t.y, t.z], dtype=float)
         return R, trans
 
+    def _lookup_body_position(self, uid: int) -> np.ndarray | None:
+        child = f"{self.bot_prefix}{uid}/{self.body_frame}".lstrip('/')
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.origin_frame_id,
+                child,
+                rclpy.time.Time(),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None
+        t = tf.transform.translation
+        return np.array([t.x, t.y, t.z], dtype=np.float32)
+
+    def _remove_points_near_centers(self, points_xyz: np.ndarray, centers: list[np.ndarray]) -> np.ndarray:
+        if points_xyz.size == 0 or not centers or self.body_filter_radius <= 0.0:
+            return points_xyz
+        keep = np.ones(points_xyz.shape[0], dtype=bool)
+        r2 = float(self.body_filter_radius * self.body_filter_radius)
+        for center in centers:
+            d2 = np.sum((points_xyz - center.reshape(1, 3)) ** 2, axis=1)
+            keep &= d2 > r2
+            if not np.any(keep):
+                break
+        return points_xyz[keep]
+
     def build_global_map(self) -> np.ndarray | None:
         if not self.bots_dict:
             return None
 
         merged_pts: np.ndarray | None = None
+        body_centers: list[np.ndarray] = []
+        if self.filter_body_points:
+            for uid in self.bots_dict.keys():
+                center = self._lookup_body_position(uid)
+                if center is not None:
+                    body_centers.append(center)
 
         for bot in self.bots_dict.values():
             uid = bot.bot_id
@@ -201,6 +240,10 @@ class MapFusionNode(Node):
             base_int = float(100 * (uid - 1))
             transformed = pts @ R.T + t
             transformed = transformed.astype(np.float32, copy=False)
+            if self.filter_body_points:
+                transformed = self._remove_points_near_centers(transformed, body_centers)
+                if transformed.size == 0:
+                    continue
             intensities = np.full((transformed.shape[0], 1), base_int, dtype=np.float32)
             combined = np.hstack((transformed, intensities))
             if merged_pts is None:

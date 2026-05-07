@@ -3,7 +3,7 @@
 <package format="3">
   <name>rover3d_navigation</name>
   <version>0.1.0</version>
-  <description>Per-robot navigation nodes that accept RViz goals and drive Fishbot agents.</description>
+  <description>GMM macro planning and pluggable micro trajectory generation for multi-robot ROS 2.</description>
   <maintainer email="artem.voronov@skoltech.ru">Artem Voronov</maintainer>
   <license>MIT</license>
 
@@ -18,7 +18,6 @@
   <depend>ament_index_python</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
-  <depend>std_srvs</depend>
 
   <depend>python3-yaml</depend>
   <depend>python3-numpy</depend>

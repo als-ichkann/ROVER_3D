@@ -1,0 +1,28 @@
+planning_node:
+  ros__parameters:
+    robot_names: ["bot1", "bot2", "bot3", "bot4"]
+    odom_suffix: "global_odom"
+    goal_topic: "goal_gmm"
+    trajectory_suffix: "trajectory"
+    control_rate: 5.0
+    max_micro_try: 10
+    gmm_interp_steps: 5
+    micro_goal_lock_radius: 0.25
+    micro_controller: "apf"  # apf | density
+    slp_epsilon: 0.2
+    use_gmm_trajectory_slp: true
+    esdf_mode: "shm"
+    esdf_shm_name: "/fiesta_esdf"
+    signed_sdf_enable: true
+    signed_sdf_occupied_eps: 1.0e-6
+    signed_sdf_inside_offset_vox: 0.5
+    esdf_frame_id: "map_origin"
+    map_origin_x: -5.0
+    map_origin_y: -7.5
+    map_origin_z: 0.0
+    map_size_x: 22.0
+    map_size_y: 17.0
+    map_size_z: 6.0
+    esdf_resolution: 0.2
+    # GC / Wasserstein / Graph 等仅由 config_dir 下预计算文件加载
+    config_dir: ""

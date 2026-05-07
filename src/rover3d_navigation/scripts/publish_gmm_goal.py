@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-从 YAML（与 config/gmm_goal_publisher.yaml 同结构）读取 GMM，向 apf_goal 发布一条消息后退出。
+从 YAML（与 config/gmm_goal_publisher.yaml 同结构）读取 GMM，向 goal_gmm 发布一条消息后退出。
 
 用法:
   ros2 run rover3d_navigation publish_gmm_goal.py
   ros2 run rover3d_navigation publish_gmm_goal.py --config /path/to/gmm_goal_publisher.yaml
 
-需已 source 工作空间；planning_apf_node 等订阅方应先运行或随后运行（TRANSIENT_LOCAL 可缓存最后一条）。
+需已 source 工作空间；planning_node 等订阅方应先运行或随后运行（TRANSIENT_LOCAL 可缓存最后一条）。
 """
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ def _build_gmm_msg(stamp_fn, means: list, covs: list, weights: list) -> GMM:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="从 YAML 发布一条 GMM 到 apf_goal")
+    parser = argparse.ArgumentParser(description="从 YAML 发布一条 GMM 到 goal_gmm")
     parser.add_argument(
         "-c",
         "--config",
@@ -158,7 +158,7 @@ def main() -> int:
         print(e, file=sys.stderr)
         return 1
 
-    goal_topic = str(params.get("goal_topic", "apf_goal"))
+    goal_topic = str(params.get("goal_topic", "goal_gmm"))
     means_raw = params.get("means", [0.0, 0.0, 0.0])
     covs_raw = list(params.get("covariances", []) or [])
     weights_raw = list(params.get("weights", [1.0]) or [1.0])

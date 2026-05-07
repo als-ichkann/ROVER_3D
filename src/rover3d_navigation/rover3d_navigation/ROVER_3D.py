@@ -1,6 +1,6 @@
 """
 ROVER_3D ：主入口与规划进程
-PlanningAPFProcess: GMM 宏观规划 + APF 轨迹生成，单步式接口供 ROS2 节点调用。
+PlanningProcess: GMM 宏观规划 + 微观轨迹生成，单步式接口供 ROS2 节点调用。
 与 MPC 分离：仅发布轨迹，控制由 mpc_control 订阅执行。
 """
 
@@ -13,7 +13,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from . import control_law_3D
+from . import apf_control_law
+from . import density_control_law
 from . import Planning_3D
 import networkx as nx
 
@@ -85,7 +86,7 @@ def _adj_to_graph(adj: np.ndarray, n: int) -> "nx.DiGraph":
 def _require_config_dir(config_dir: Optional[str]) -> str:
     if not config_dir or not str(config_dir).strip():
         raise ValueError(
-            "PlanningAPFProcess 需要非空 config_dir，目录中须包含预计算文件："
+            "PlanningProcess 需要非空 config_dir，目录中须包含预计算文件："
             "GC_means_3D.json, GC_covs_3D.json, Wasserstein_table_3D.npy, "
             "Node_PDF_table_3D.npy, Graph_GC_3D.npy（可用 scripts/precompute_config_prior.py 生成）"
         )
@@ -137,10 +138,10 @@ def _load_precomputed_tables(config_dir: str) -> Tuple[list, list, np.ndarray, n
     return gc_means, gc_covs, w, pdf, graph_adj
 
 
-class PlanningAPFProcess:
+class PlanningProcess:
     """
     ROS2 兼容规划进程：单步式 run_one_cycle 接口。
-    无多进程、无 MPC：仅做 GMM 优化 + APF 轨迹生成。
+    无多进程、无 MPC：仅做 GMM 优化 + 微观轨迹生成。
     """
 
     def __init__(
@@ -157,10 +158,13 @@ class PlanningAPFProcess:
         goal_covs: list,
         goal_weights: list,
         gmm_interp_steps: int = 5,
-        max_apf_try: int = 10,
-        apf_goal_lock_radius: float = 0.25,
+        max_micro_try: int = 10,
+        micro_goal_lock_radius: float = 0.25,
+        max_apf_try: Optional[int] = None,
+        apf_goal_lock_radius: Optional[float] = None,
         slp_epsilon: float = 0.2,
         use_gmm_trajectory_slp: bool = True,
+        micro_controller: str = "apf",
         config_dir: Optional[str] = None,
     ):
         self.num_robots = num_robots
@@ -169,11 +173,21 @@ class PlanningAPFProcess:
         self.ya, self.yb = ya, yb
         self.za, self.zb = za, zb
         self.gmm_interp_steps = gmm_interp_steps
-        self.max_apf_try = max_apf_try
-        self.apf_goal_lock_radius = max(0.0, float(apf_goal_lock_radius))
+        if max_apf_try is not None:
+            max_micro_try = int(max_apf_try)
+        if apf_goal_lock_radius is not None:
+            micro_goal_lock_radius = float(apf_goal_lock_radius)
+        self.max_micro_try = int(max_micro_try)
+        self.micro_goal_lock_radius = max(0.0, float(micro_goal_lock_radius))
         self.slp_epsilon = float(slp_epsilon)
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
+        self.micro_controller = str(micro_controller).lower().strip()
+        if self.micro_controller not in ("apf", "density"):
+            raise ValueError(
+                f"Unsupported micro_controller={micro_controller!r}, expected 'apf' or 'density'"
+            )
         self.alpha = 0.05
+        self._density_controller = density_control_law.DensityController3D(seed=0)
 
         cfg = _require_config_dir(config_dir)
         gc_means, gc_covs, w_load, pdf_load, graph_load = _load_precomputed_tables(cfg)
@@ -248,6 +262,7 @@ class PlanningAPFProcess:
                 self.goalFlag = 0
                 self.optimization_k += 1
                 self.step = 0
+                self._density_controller.reset()
             else:
                 current_goal = [self.current_means, self.current_covs, self.current_weights]
                 if self.step < len(self.GMM) and len(self.GMM) > 0:
@@ -297,6 +312,7 @@ class PlanningAPFProcess:
                 self.goalFlag = 0
                 self.optimization_k += 1
                 self.step = 0
+                self._density_controller.reset()
 
         if len(self.GMM) == 0:
             return None
@@ -308,12 +324,12 @@ class PlanningAPFProcess:
         next_covs = [np.asarray(c).reshape(3, 3) if np.size(c) == 9 else c for c in next_c]
         next_weights = list(next_w)
 
-        # 每周期用实时 odom 作为 APF 起点。若沿用上一拍 APF 输出，多步开环会使
+        # 每周期用实时 odom 作为微观轨迹起点。若沿用上一拍输出，多步开环会使
         # 「等效位置」漂移，吸引势相对虚点计算，易出现全体朝某一象限偏航（与目标均值无关）。
         self.robots_positions_expected = np.array(robots_positions, copy=True)
 
         # 接近当前宏观目标时锁定当前位置，避免在吸引梯度接近 0 时被斥力继续推走。
-        if self.apf_goal_lock_radius > 0 and len(next_means) > 0:
+        if self.micro_goal_lock_radius > 0 and len(next_means) > 0:
             weights_np = np.asarray(next_weights, dtype=float).reshape(-1)
             means_np = np.asarray(next_means, dtype=float).reshape(-1, 3)
             if np.sum(weights_np) > 1e-12 and means_np.shape[0] == weights_np.shape[0]:
@@ -323,29 +339,57 @@ class PlanningAPFProcess:
                 macro_center = np.mean(means_np, axis=0)
             swarm_center = np.mean(self.robots_positions_expected, axis=0)
             center_dist = float(np.linalg.norm(swarm_center - macro_center))
-            if center_dist <= self.apf_goal_lock_radius:
+            if center_dist <= self.micro_goal_lock_radius:
                 trajectories = [
                     np.array([self.robots_positions_expected[i]], dtype=float)
                     for i in range(self.num_robots)
                 ]
                 print(
-                    f"[APF] lock at macro target: step={self.step}, "
-                    f"center_dist={center_dist:.4f}, radius={self.apf_goal_lock_radius:.4f}"
+                    f"[MICRO] lock at macro target: step={self.step}, "
+                    f"center_dist={center_dist:.4f}, radius={self.micro_goal_lock_radius:.4f}"
                 )
                 if self.step == len(self.GMM) - 1:
                     self.goalFlag = 1
                 self.step += 1
                 return trajectories, self.stop_flag
 
-        # APF 一步
-        self.robots_positions_expected, robots_positions_list, _, _, _ = control_law_3D.APF(
-            next_means,
-            next_covs,
-            next_weights,
-            self.robots_positions_expected,
-            self.esdf_map,
-            MaxNumTry=self.max_apf_try,
-        )
+        if self.micro_controller == "apf":
+            self.robots_positions_expected, robots_positions_list, _, _, _ = apf_control_law.APF(
+                next_means,
+                next_covs,
+                next_weights,
+                self.robots_positions_expected,
+                self.esdf_map,
+                MaxNumTry=self.max_micro_try,
+            )
+        else:
+            if self.step > 0 and self.step - 1 < len(self.GMM):
+                src_m, src_c, src_w = self.GMM[self.step - 1]
+            else:
+                src_m, src_c, src_w = self.current_means, self.current_covs, self.current_weights
+            next_pos, robots_positions_list = self._density_controller.step(
+                src_m,
+                src_c,
+                src_w,
+                next_means,
+                next_covs,
+                next_weights,
+                self.robots_positions_expected,
+            )
+            # 约束到地图边界，并在明显碰撞时回退到当前位置
+            next_pos[:, 0] = np.minimum(np.maximum(next_pos[:, 0], self.xa + 1e-6), self.xb - 1e-6)
+            next_pos[:, 1] = np.minimum(np.maximum(next_pos[:, 1], self.ya + 1e-6), self.yb - 1e-6)
+            next_pos[:, 2] = np.minimum(np.maximum(next_pos[:, 2], self.za + 1e-6), self.zb - 1e-6)
+            try:
+                d = self.esdf_map.get_esdf(next_pos)
+                d = np.asarray(d, dtype=float).reshape(-1)
+                bad = np.where(d <= 0.0)[0]
+                if len(bad) > 0:
+                    next_pos[bad] = self.robots_positions_expected[bad]
+                    robots_positions_list = [next_pos.copy()]
+            except Exception:
+                pass
+            self.robots_positions_expected = next_pos
 
         trajectories = []
         for i in range(self.num_robots):
@@ -356,3 +400,7 @@ class PlanningAPFProcess:
             self.goalFlag = 1
         self.step += 1
         return trajectories, self.stop_flag
+
+
+# Backward compatibility alias
+PlanningAPFProcess = PlanningProcess

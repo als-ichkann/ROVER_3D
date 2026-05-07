@@ -52,7 +52,7 @@ services:
   #   volumes:
   #     - ./src/rover3d_navigation/:/fishbot_ws/src/rover3d_navigation/
   #   command: >
-  #     bash -lc "ros2 launch rover3d_navigation navigation.launch.py robots:=${FISHBOT_NAV_ROBOTS:-bot1}"
+  #     bash -lc "ros2 launch rover3d_navigation planning.launch.py robots:=${FISHBOT_NAV_ROBOTS:-bot1}"
 
   foxglove:
     container_name: fishbot_foxglove
@@ -131,7 +131,7 @@ services:
     volumes:
       - ./src/rover3d_navigation/:/fishbot_ws/src/rover3d_navigation/
     command: >
-      bash -lc "ros2 launch rover3d_navigation planning_apf.launch.py robots:=${FISHBOT_NAV_ROBOTS:-bot1,bot2,bot3,bot4}"
+      bash -lc "ros2 launch rover3d_navigation planning.launch.py robots:=${FISHBOT_NAV_ROBOTS:-bot1,bot2,bot3,bot4}"
 
   map_fusion:
     container_name: map_fusion

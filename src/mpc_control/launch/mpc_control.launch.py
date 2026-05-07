@@ -2,7 +2,7 @@
 """
 MPC Drone Control Launch
 
-为每台机器人启动 MPC 轨迹跟踪控制器，订阅 apf_trajectory，发布 cmd_vel。
+为每台机器人启动 MPC 轨迹跟踪控制器，订阅 trajectory，发布 cmd_vel。
 定位统一使用 Swarm-LIO2 + map_fusion 发布的 global_odom。
 
 使用方法:
@@ -10,7 +10,7 @@ MPC Drone Control Launch
   ros2 launch mpc_control mpc_control.launch.py robots:=bot1,bot2,bot3
 
 前提：
-  - planning_apf 节点已运行，并发布 /{robot}/apf_trajectory
+  - planning_node 已运行，并发布 /{robot}/trajectory
   - map_fusion 节点已运行，发布 /{robot}/global_odom（依赖 Swarm-LIO2）
 """
 from typing import List
@@ -79,7 +79,7 @@ def _mpc_control_setup(context, *args, **kwargs):
                 parameters=[params],
                 remappings=[
                     (odom_suffix, f"{prefix}/{odom_suffix}"),
-                    ("trajectory", f"{prefix}/apf_trajectory"),
+                    ("trajectory", f"{prefix}/trajectory"),
                     ("cmd_vel", f"{prefix}/cmd_vel"),
                 ],
             )

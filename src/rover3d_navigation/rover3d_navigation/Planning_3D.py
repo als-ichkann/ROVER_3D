@@ -1,13 +1,12 @@
 import numpy as np
 import scipy.linalg
 import scipy.sparse
+from scipy.optimize import linprog
 from scipy.stats import norm
 try:
-    from . import control_law_3D
     from .cvar_esdf import compute_cvar_from_esdf, linearize_cvar_constraint_fd, _normalize_weights  
     from .gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
 except ImportError:
-    import control_law_3D
     from cvar_esdf import compute_cvar_from_esdf, linearize_cvar_constraint_fd, _normalize_weights
     from gen_path_table import find_mean_index, notgreedy_genPathTable, shortest_path
 import math
@@ -76,6 +75,55 @@ def initialize_path_flow(path_table, current_weights, fweights):
     return PIa
 
 
+def Wasserstein_distance(mean1, cov1, mean2, cov2):
+    """Wasserstein-2 distance between two Gaussian components."""
+    mean1 = np.asarray(mean1, dtype=float)
+    mean2 = np.asarray(mean2, dtype=float)
+    cov1 = np.asarray(cov1, dtype=float)
+    cov2 = np.asarray(cov2, dtype=float)
+    add1 = np.linalg.norm(mean1 - mean2)
+    if np.array_equal(cov1, cov2):
+        return add1
+    add2 = np.trace(
+        cov1 + cov2 - 2 * scipy.linalg.sqrtm(scipy.linalg.sqrtm(cov1) @ cov2 @ scipy.linalg.sqrtm(cov1))
+    )
+    return float((add1 ** 2 + add2) ** 0.5)
+
+
+def calWGMetric_speedUp(means1, covs1, weights1, means2, covs2, weights2):
+    """Solve OT between two GMMs and return (WG_sq, plan, WG)."""
+    num_comp_p, num_comp_q = len(means1), len(means2)
+    total_mass = min(sum(weights1), sum(weights2))
+    weights1 = [w / sum(weights1) * total_mass for w in weights1]
+    weights2 = [w / sum(weights2) * total_mass for w in weights2]
+
+    C = np.zeros((num_comp_p, num_comp_q), dtype=float)
+    for i in range(num_comp_p):
+        for j in range(num_comp_q):
+            C[i, j] = Wasserstein_distance(means1[i], covs1[i], means2[j], covs2[j]) ** 2
+    f = C.T.flatten()
+
+    Aeq = np.zeros((num_comp_p + num_comp_q, num_comp_p * num_comp_q), dtype=float)
+    for i in range(num_comp_q):
+        Aeq[i, i * num_comp_p: (i + 1) * num_comp_p] = 1
+    for i in range(num_comp_q, num_comp_p + num_comp_q):
+        Aeq[i, i - num_comp_q::num_comp_p] = 1
+    beq = np.array(weights2 + weights1)
+
+    result = linprog(
+        f,
+        A_eq=Aeq,
+        b_eq=beq,
+        bounds=[(0, 1)] * (num_comp_p * num_comp_q),
+        method="highs-ds",
+    )
+    if not result.success:
+        raise RuntimeError(f"Linear programming did not succeed: {result.message}")
+
+    W, fval = result.x, float(result.fun)
+    return fval, W, float(np.sqrt(fval))
+
+
 def Optimization_SLP(
     current_means,
     current_covs,
@@ -109,7 +157,7 @@ def Optimization_SLP(
     说明
     ----
     这版函数假设以下依赖已经在你的工程里存在：
-        - control_law_3D.calWGMetric_speedUp
+        - calWGMetric_speedUp
         - notgreedy_genPathTable
         - qpsolvers.solve_qp
     """
@@ -190,7 +238,7 @@ def Optimization_SLP(
     # --------------------------------------------------------
     # Step 2: Wasserstein 终止判据
     # --------------------------------------------------------
-    WG_sq, W, _ = control_law_3D.calWGMetric_speedUp(
+    WG_sq, W, _ = calWGMetric_speedUp(
         current_means, current_covs, current_weights,
         fmeans, fcovs, fweights
     )
@@ -232,7 +280,7 @@ def Optimization_SLP(
 
     if path_table.shape[0] == 0:
         print("[4] 路径表为空（无可达路径），回退为直达目标")
-        _, W, _ = control_law_3D.calWGMetric_speedUp(
+        _, W, _ = calWGMetric_speedUp(
             current_means, current_covs, current_weights,
             fmeans, fcovs, fweights
         )
@@ -550,7 +598,7 @@ def Optimization_SLP(
 def interpGMM_PRM(means1, covs1, weights1, means2, covs2, weights2, TransferMatrix, flag):
     delDist = 0.2
     dimW = 3
-    WG_sq, W, _ = control_law_3D.calWGMetric_speedUp(means1, covs1, weights1, means2, covs2, weights2)
+    WG_sq, W, _ = calWGMetric_speedUp(means1, covs1, weights1, means2, covs2, weights2)
     d = np.sqrt(WG_sq)
     numPoint = math.ceil(d / delDist)
     W = TransferMatrix
