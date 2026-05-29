@@ -12,6 +12,8 @@ import time
 from typing import List, Optional, Tuple
 
 import numpy as np
+from scipy.stats import multivariate_normal
+from sklearn.mixture import GaussianMixture
 
 from . import apf_control_law
 from . import density_control_law
@@ -93,6 +95,61 @@ def _require_config_dir(config_dir: Optional[str]) -> str:
     return os.path.abspath(os.path.expanduser(str(config_dir).strip()))
 
 
+def _normalize_weights(weights: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+    w[w < 0.0] = 0.0
+    s = float(np.sum(w))
+    if s <= eps:
+        return np.ones_like(w) / max(len(w), 1)
+    return w / s
+
+
+def _gmm_min_sensor_pdf(
+    means: list,
+    covs: list,
+    weights: list,
+    positions: np.ndarray,
+) -> float:
+    pts = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if pts.shape[0] == 0 or len(means) == 0:
+        return 0.0
+    ws = _normalize_weights(np.asarray(weights, dtype=float))
+    mu = np.asarray(means, dtype=float).reshape(-1, 3)
+    total_pdf = np.zeros(pts.shape[0], dtype=float)
+    for k in range(mu.shape[0]):
+        try:
+            sigma = np.asarray(covs[k], dtype=float).reshape(3, 3)
+            pk = multivariate_normal(mean=mu[k], cov=sigma, allow_singular=True).pdf(pts)
+            total_pdf += ws[k] * np.asarray(pk, dtype=float)
+        except Exception:
+            continue
+    total_pdf = np.nan_to_num(total_pdf, nan=0.0, posinf=0.0, neginf=0.0)
+    return float(np.min(total_pdf)) if total_pdf.size > 0 else 0.0
+
+
+def _estimate_swarm_gmm_em(
+    positions: np.ndarray,
+    n_components: int,
+    reg_covar: float = 1e-6,
+) -> tuple:
+    pts = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        raise ValueError("positions is empty")
+    k = max(1, min(int(n_components), pts.shape[0]))
+    em = GaussianMixture(
+        n_components=k,
+        covariance_type="full",
+        reg_covar=float(reg_covar),
+        random_state=0,
+    )
+    em.fit(pts)
+    means = np.asarray(em.means_, dtype=float)
+    covs = np.asarray(em.covariances_, dtype=float)
+    weights = _normalize_weights(np.asarray(em.weights_, dtype=float))
+    return means, covs, weights
+
+
 def _load_precomputed_tables(config_dir: str) -> Tuple[list, list, np.ndarray, np.ndarray, np.ndarray]:
     """仅从磁盘加载 GC 与 Wasserstein / Node_PDF / Graph 邻接，不做运行时重算。"""
     files = (
@@ -160,8 +217,7 @@ class PlanningProcess:
         gmm_interp_steps: int = 5,
         max_micro_try: int = 10,
         micro_goal_lock_radius: float = 0.25,
-        max_apf_try: Optional[int] = None,
-        apf_goal_lock_radius: Optional[float] = None,
+        density_traj_steps: int = 8,
         slp_epsilon: float = 0.2,
         use_gmm_trajectory_slp: bool = True,
         micro_controller: str = "apf",
@@ -173,12 +229,9 @@ class PlanningProcess:
         self.ya, self.yb = ya, yb
         self.za, self.zb = za, zb
         self.gmm_interp_steps = gmm_interp_steps
-        if max_apf_try is not None:
-            max_micro_try = int(max_apf_try)
-        if apf_goal_lock_radius is not None:
-            micro_goal_lock_radius = float(apf_goal_lock_radius)
         self.max_micro_try = int(max_micro_try)
         self.micro_goal_lock_radius = max(0.0, float(micro_goal_lock_radius))
+        self.density_traj_steps = max(1, int(density_traj_steps))
         self.slp_epsilon = float(slp_epsilon)
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
         self.micro_controller = str(micro_controller).lower().strip()
@@ -187,7 +240,13 @@ class PlanningProcess:
                 f"Unsupported micro_controller={micro_controller!r}, expected 'apf' or 'density'"
             )
         self.alpha = 0.05
-        self._density_controller = density_control_law.DensityController3D(seed=0)
+        self._density_controller = density_control_law.DensityController3D(
+            seed=0,
+            traj_steps=self.density_traj_steps,
+            esdf_map=self.esdf_map,
+            safe_margin=0.1,
+            use_astar_path=True,
+        )
 
         cfg = _require_config_dir(config_dir)
         gc_means, gc_covs, w_load, pdf_load, graph_load = _load_precomputed_tables(cfg)
@@ -231,6 +290,7 @@ class PlanningProcess:
         self.step = 0
         self.robots_positions_expected: Optional[np.ndarray] = None
         self.stop_flag = False
+        self.sensor_pdf_threshold = 1e-4
 
     def run_one_cycle(
         self, robots_positions: np.ndarray
@@ -270,6 +330,31 @@ class PlanningProcess:
                     if len(prev) >= 3:
                         current_goal = prev
 
+                # 对齐旧版宏观规划逻辑：先判断当前机器人位置与上一拍宏观分布是否一致，
+                # 偏离过大时才用实时位置重估当前 GMM；否则直接沿用上一拍宏观分布。
+                init_means, init_covs, init_weights = (
+                    np.asarray(current_goal[0], dtype=float),
+                    np.asarray(current_goal[1], dtype=float),
+                    np.asarray(current_goal[2], dtype=float),
+                )
+                try:
+                    min_sensor_pdf = _gmm_min_sensor_pdf(
+                        init_means.tolist(),
+                        init_covs.tolist(),
+                        init_weights.tolist(),
+                        rpe,
+                    )
+                except Exception:
+                    min_sensor_pdf = 0.0
+                if min_sensor_pdf < self.sensor_pdf_threshold:
+                    try:
+                        em_means, em_covs, em_weights = _estimate_swarm_gmm_em(
+                            rpe, n_components=max(1, len(init_means))
+                        )
+                        init_means, init_covs, init_weights = em_means, em_covs, em_weights
+                    except Exception:
+                        pass
+
                 (
                     self.goal_means,
                     self.goal_covs,
@@ -280,9 +365,9 @@ class PlanningProcess:
                     TransferMatrix,
                     self.flag,
                 ) = Planning_3D.Optimization_SLP(
-                    self.current_means,
-                    self.current_covs,
-                    self.current_weights,
+                    init_means,
+                    init_covs,
+                    init_weights,
                     self.fmeans,
                     self.fcovs,
                     self.fweights,
@@ -298,6 +383,7 @@ class PlanningProcess:
                     self.Node_PDF_table,
                     robots_positions=rpe,
                     epsilon=self.slp_epsilon,
+                    use_em_from_odom=False,
                 )
                 self.GMM, self.WStack = Planning_3D.interpGMM_PRM(
                     self.current_means,
@@ -329,7 +415,11 @@ class PlanningProcess:
         self.robots_positions_expected = np.array(robots_positions, copy=True)
 
         # 接近当前宏观目标时锁定当前位置，避免在吸引梯度接近 0 时被斥力继续推走。
-        if self.micro_goal_lock_radius > 0 and len(next_means) > 0:
+        if (
+            self.micro_controller == "apf"
+            and self.micro_goal_lock_radius > 0
+            and len(next_means) > 0
+        ):
             weights_np = np.asarray(next_weights, dtype=float).reshape(-1)
             means_np = np.asarray(next_means, dtype=float).reshape(-1, 3)
             if np.sum(weights_np) > 1e-12 and means_np.shape[0] == weights_np.shape[0]:
@@ -386,7 +476,6 @@ class PlanningProcess:
                 bad = np.where(d <= 0.0)[0]
                 if len(bad) > 0:
                     next_pos[bad] = self.robots_positions_expected[bad]
-                    robots_positions_list = [next_pos.copy()]
             except Exception:
                 pass
             self.robots_positions_expected = next_pos
@@ -400,7 +489,3 @@ class PlanningProcess:
             self.goalFlag = 1
         self.step += 1
         return trajectories, self.stop_flag
-
-
-# Backward compatibility alias
-PlanningAPFProcess = PlanningProcess

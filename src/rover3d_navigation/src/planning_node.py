@@ -10,13 +10,14 @@ from typing import Dict, Optional
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from navigation_msgs.msg import GMM
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rover3d_navigation.ROVER_3D import PlanningProcess
 from rover3d_navigation.esdf_adapter import EsdfShmAdapter
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 class PlanningNode(Node):
@@ -29,16 +30,20 @@ class PlanningNode(Node):
         self.declare_parameter("odom_suffix", "global_odom")
         self.declare_parameter("goal_topic", "goal_gmm")
         self.declare_parameter("trajectory_suffix", "trajectory")
+        self.declare_parameter("trajectory_marker_topic", "trajectory_markers")
+        self.declare_parameter("trajectory_marker_line_width", 0.06)
         self.declare_parameter("control_rate", 5.0)
         self.declare_parameter("max_micro_try", 10)
         self.declare_parameter("gmm_interp_steps", 5)
         self.declare_parameter("micro_goal_lock_radius", 0.25)
+        self.declare_parameter("density_traj_steps", 8)
         self.declare_parameter("slp_epsilon", 0.2)
         self.declare_parameter("use_gmm_trajectory_slp", True)
         self.declare_parameter("micro_controller", "apf")
         self.declare_parameter("esdf_mode", "shm")
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
         self.declare_parameter("signed_sdf_enable", True)
+        self.declare_parameter("esdf_native_signed", True)
         self.declare_parameter("signed_sdf_occupied_eps", 1e-6)
         self.declare_parameter("signed_sdf_inside_offset_vox", 0.5)
         self.declare_parameter("esdf_frame_id", "map_origin")
@@ -51,10 +56,6 @@ class PlanningNode(Node):
         self.declare_parameter("esdf_resolution", 0.15)
         self.declare_parameter("config_dir", "")
 
-        # 兼容旧参数命名
-        self.declare_parameter("max_apf_try", 10)
-        self.declare_parameter("apf_goal_lock_radius", 0.25)
-
         robot_names = self.get_parameter("robot_names").value
         if isinstance(robot_names, str):
             robot_names = [n.strip() for n in robot_names.split(",") if n.strip()]
@@ -62,17 +63,18 @@ class PlanningNode(Node):
         self._odom_suffix = str(self.get_parameter("odom_suffix").value)
         self._goal_topic = str(self.get_parameter("goal_topic").value)
         self._traj_suffix = str(self.get_parameter("trajectory_suffix").value)
+        self._traj_marker_topic = str(self.get_parameter("trajectory_marker_topic").value)
+        self._traj_marker_line_width = float(
+            self.get_parameter("trajectory_marker_line_width").value
+        )
         self._control_rate = float(self.get_parameter("control_rate").value)
 
-        max_micro_try = int(self.get_parameter("max_micro_try").value)
-        max_apf_try = int(self.get_parameter("max_apf_try").value)
-        self._max_micro_try = max_micro_try if max_micro_try > 0 else max_apf_try
+        self._max_micro_try = int(self.get_parameter("max_micro_try").value)
         self._gmm_interp_steps = int(self.get_parameter("gmm_interp_steps").value)
+        self._density_traj_steps = int(self.get_parameter("density_traj_steps").value)
 
-        micro_goal_lock_radius = float(self.get_parameter("micro_goal_lock_radius").value)
-        apf_goal_lock_radius = float(self.get_parameter("apf_goal_lock_radius").value)
-        self._micro_goal_lock_radius = (
-            micro_goal_lock_radius if micro_goal_lock_radius > 0 else apf_goal_lock_radius
+        self._micro_goal_lock_radius = float(
+            self.get_parameter("micro_goal_lock_radius").value
         )
         self._slp_epsilon = float(self.get_parameter("slp_epsilon").value)
         self._use_gmm_trajectory_slp = bool(self.get_parameter("use_gmm_trajectory_slp").value)
@@ -122,6 +124,7 @@ class PlanningNode(Node):
         self._path_pubs: Dict[str, object] = {}
         for name in self._robot_names:
             self._path_pubs[name] = self.create_publisher(Path, f"{name}/{self._traj_suffix}", 10)
+        self._traj_marker_pub = self.create_publisher(MarkerArray, self._traj_marker_topic, 10)
 
         esdf_mode = str(self.get_parameter("esdf_mode").value).lower()
         if esdf_mode != "shm":
@@ -138,6 +141,7 @@ class PlanningNode(Node):
             map_size_z=float(self.get_parameter("map_size_z").value),
             resolution=float(self.get_parameter("esdf_resolution").value),
             signed_sdf_enable=bool(self.get_parameter("signed_sdf_enable").value),
+            source_is_signed=bool(self.get_parameter("esdf_native_signed").value),
             signed_sdf_occupied_eps=float(self.get_parameter("signed_sdf_occupied_eps").value),
             signed_sdf_inside_offset_vox=float(self.get_parameter("signed_sdf_inside_offset_vox").value),
         )
@@ -242,6 +246,7 @@ class PlanningNode(Node):
                 gmm_interp_steps=self._gmm_interp_steps,
                 max_micro_try=self._max_micro_try,
                 micro_goal_lock_radius=self._micro_goal_lock_radius,
+                density_traj_steps=self._density_traj_steps,
                 slp_epsilon=self._slp_epsilon,
                 use_gmm_trajectory_slp=self._use_gmm_trajectory_slp,
                 micro_controller=self._micro_controller,
@@ -297,9 +302,11 @@ class PlanningNode(Node):
         if not self._first_publish_done:
             self.get_logger().info(
                 f"Published first trajectories: {num_pts} pose(s), frame={path_frame}, "
-                f"topics={[f'{r}/{self._traj_suffix}' for r in self._robot_names]}"
+                f"topics={[f'{r}/{self._traj_suffix}' for r in self._robot_names]}, "
+                f"marker_topic={self._traj_marker_topic}"
             )
             self._first_publish_done = True
+        self._publish_trajectory_markers(trajectories, path_frame, stamp)
         now = self.get_clock().now().nanoseconds / 1e9
         if now - self._last_traj_log_time > 2.0:
             self.get_logger().info(
@@ -313,6 +320,59 @@ class PlanningNode(Node):
         path.header.frame_id = "map_origin"
         for pub in self._path_pubs.values():
             pub.publish(path)
+        self._publish_clear_trajectory_markers(path.header.frame_id, path.header.stamp)
+
+    def _robot_color(self, index: int) -> tuple[float, float, float, float]:
+        palette = [
+            (1.0, 0.1, 0.1, 1.0),   # red
+            (0.1, 0.8, 0.1, 1.0),   # green
+            (0.1, 0.35, 1.0, 1.0),  # blue
+            (1.0, 0.75, 0.05, 1.0), # yellow
+            (0.9, 0.1, 0.9, 1.0),   # magenta
+            (0.0, 0.85, 0.85, 1.0), # cyan
+            (1.0, 0.45, 0.05, 1.0), # orange
+            (0.6, 0.25, 1.0, 1.0),  # purple
+        ]
+        return palette[index % len(palette)]
+
+    def _publish_trajectory_markers(self, trajectories, frame_id: str, stamp) -> None:
+        marker_array = MarkerArray()
+        for i, name in enumerate(self._robot_names):
+            marker = Marker()
+            marker.header.frame_id = frame_id
+            marker.header.stamp = stamp
+            marker.ns = "robot_trajectories"
+            marker.id = i
+            marker.type = Marker.LINE_STRIP
+            marker.action = Marker.ADD
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = max(self._traj_marker_line_width, 1e-3)
+            r, g, b, a = self._robot_color(i)
+            marker.color.r = r
+            marker.color.g = g
+            marker.color.b = b
+            marker.color.a = a
+            if i < len(trajectories):
+                for pt in trajectories[i]:
+                    p = Point()
+                    p.x = float(pt[0])
+                    p.y = float(pt[1])
+                    p.z = float(pt[2])
+                    marker.points.append(p)
+            if len(marker.points) < 2:
+                marker.action = Marker.DELETE
+            marker_array.markers.append(marker)
+        self._traj_marker_pub.publish(marker_array)
+
+    def _publish_clear_trajectory_markers(self, frame_id: str, stamp) -> None:
+        marker_array = MarkerArray()
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = stamp
+        marker.ns = "robot_trajectories"
+        marker.action = Marker.DELETEALL
+        marker_array.markers.append(marker)
+        self._traj_marker_pub.publish(marker_array)
 
 
 def main(args=None) -> None:
@@ -324,7 +384,8 @@ def main(args=None) -> None:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

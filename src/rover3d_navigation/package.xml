@@ -15,6 +15,7 @@
   <depend>navigation_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
   <depend>ament_index_python</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>

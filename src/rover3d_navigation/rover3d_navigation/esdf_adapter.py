@@ -20,6 +20,7 @@ from scipy.ndimage import distance_transform_edt
 
 _SHM_MAGIC = b"FIESESDF"
 _SHM_HEADER_SIZE = 56
+_SHM_LAYOUT_VERSION_SIGNED = 2
 
 
 def _trilinear_scalar(
@@ -214,6 +215,7 @@ class EsdfShmAdapter:
         map_size_z: float = 6.0,
         resolution: float = 0.15,
         signed_sdf_enable: bool = True,
+        source_is_signed: bool = True,
         signed_sdf_occupied_eps: float = 1e-6,
         signed_sdf_inside_offset_vox: float = 0.5,
     ) -> None:
@@ -229,8 +231,11 @@ class EsdfShmAdapter:
         self._grid_raw: Optional[np.ndarray] = None
         self._dist_grid: Optional[np.ndarray] = None
         self._ready = False
+        self._layout_version = 0
+        self._source_is_signed_runtime = bool(source_is_signed)
 
         self.signed_sdf_enable = bool(signed_sdf_enable)
+        self.source_is_signed = bool(source_is_signed)
         self.signed_sdf_occupied_eps = float(signed_sdf_occupied_eps)
         self.signed_sdf_inside_offset_vox = float(signed_sdf_inside_offset_vox)
         self._signed_stats_logged = False
@@ -238,7 +243,8 @@ class EsdfShmAdapter:
         self._refresh()
         self._node.get_logger().info(
             f"EsdfShmAdapter: use shared memory {shm_name}; "
-            f"signed_sdf={'on' if self.signed_sdf_enable else 'off'}"
+            f"signed_sdf={'on' if self.signed_sdf_enable else 'off'}; "
+            f"source_is_signed={'yes' if self.source_is_signed else 'no'}"
         )
 
     def _shm_path(self) -> str:
@@ -259,6 +265,7 @@ class EsdfShmAdapter:
 
             nx, ny, nz = struct.unpack("<III", header[8:20])
             res, ox, oy, oz = struct.unpack("<dddd", header[20:52])
+            (layout_version,) = struct.unpack("<I", header[52:56])
             data_size = nx * ny * nz * 4 * 4
 
             with open(path, "rb") as f:
@@ -271,15 +278,22 @@ class EsdfShmAdapter:
             self.dims = np.array([nx, ny, nz], dtype=int)
             self.origin = (ox, oy, oz)
             self.resolution = float(res)
+            self._layout_version = int(layout_version)
+            self._source_is_signed_runtime = bool(
+                self.source_is_signed or (self._layout_version >= _SHM_LAYOUT_VERSION_SIGNED)
+            )
 
             base_dist = self._grid_raw[..., 0]
             if self.signed_sdf_enable:
-                self._dist_grid = _build_signed_sdf(
-                    base_dist,
-                    self.resolution,
-                    self.signed_sdf_occupied_eps,
-                    self.signed_sdf_inside_offset_vox,
-                )
+                if self._source_is_signed_runtime:
+                    self._dist_grid = base_dist.copy()
+                else:
+                    self._dist_grid = _build_signed_sdf(
+                        base_dist,
+                        self.resolution,
+                        self.signed_sdf_occupied_eps,
+                        self.signed_sdf_inside_offset_vox,
+                    )
             else:
                 self._dist_grid = base_dist.copy()
 
@@ -326,8 +340,14 @@ class EsdfShmAdapter:
         if ok and self.signed_sdf_enable and not self._signed_stats_logged and self._dist_grid is not None:
             g = self._dist_grid
             self._node.get_logger().info(
-                "Signed SDF ready: min=%.4f max=%.4f neg_voxels=%d"
-                % (float(np.min(g)), float(np.max(g)), int(np.sum(g < 0.0)))
+                "Signed SDF ready: min=%.4f max=%.4f neg_voxels=%d layout_ver=%d source_is_signed=%s"
+                % (
+                    float(np.min(g)),
+                    float(np.max(g)),
+                    int(np.sum(g < 0.0)),
+                    int(self._layout_version),
+                    "yes" if self._source_is_signed_runtime else "no",
+                )
             )
             self._signed_stats_logged = True
         return ok

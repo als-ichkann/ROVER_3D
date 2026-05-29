@@ -7,15 +7,17 @@ from scipy.stats import multivariate_normal
 # ---------------------------------------------------------------------------
 # APF 调参
 # ---------------------------------------------------------------------------
-APF_SIGMA_K_DIAG = 0.45
-APF_ATTRACT_GAIN = 2.7
-APF_AGENT_REPULSE_GAIN = 0.28
-APF_ESDF_REPULSE_GAIN = 0.32
+APF_SIGMA_K_DIAG = 0.65
+APF_ATTRACT_GAIN = 1.8
+APF_AGENT_REPULSE_GAIN = 0.18
+APF_ESDF_REPULSE_GAIN = 0.24
 APF_ESDF_SAFE_DIST_MIN = 0.08
-APF_ATT_REP_UNIT_BLEND = 0.68
-APF_BOUNDARY_REPULSE_GAIN = 0.35
-APF_GAMMA_INTER_AGENT = 0.22
-APF_MAX_VELOCITY_BASE = 0.78
+APF_ATT_REP_UNIT_BLEND = 0.76
+APF_BOUNDARY_REPULSE_GAIN = 0.24
+APF_GAMMA_INTER_AGENT = 0.14
+APF_MAX_VELOCITY_BASE = 0.48
+APF_OBSTACLE_WARN_PERIOD_SEC = 2.0
+_last_obstacle_warning_time = 0.0
 
 
 def APF(next_means, next_covs, next_weights, robots_positions, esdf_map, MaxNumTry=10):
@@ -117,7 +119,7 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         esdf_distances[i] = d - Rradius
         grad = esdf_map.compute_gradient(pos)
         esdf_gradients[i] = grad if grad is not None else np.zeros(dim)
-    in_repulsion_zone = (esdf_distances > 0) & (esdf_distances <= r_repulsion_obstacle)
+    in_repulsion_zone = esdf_distances <= r_repulsion_obstacle
     affected_agents = np.where(in_repulsion_zone)[0]
     if affected_agents.size > 0:
         safe_dists = np.maximum(esdf_distances[affected_agents], APF_ESDF_SAFE_DIST_MIN)
@@ -219,9 +221,16 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
                 dU[j, :] = rep_u[j, :]
     U = U_sensor_gmm + gamma * U_sensor
 
-    dists = esdf_map.get_esdf(robots_positions)
+    dists = np.asarray(esdf_map.get_esdf(robots_positions), dtype=float).reshape(-1)
     if np.any(dists <= 0):
-        print("There are some sensors in the obstacle areas!!!")
+        global _last_obstacle_warning_time
+        now = time.time()
+        if now - _last_obstacle_warning_time >= APF_OBSTACLE_WARN_PERIOD_SEC:
+            _last_obstacle_warning_time = now
+            print(
+                "There are some sensors in the obstacle areas!!! "
+                f"count={int(np.sum(dists <= 0))}, min_esdf={float(np.min(dists)):.4f}"
+            )
 
     SensorPos_next = robots_positions - dU * max_Velocity
     dists = esdf_map.get_esdf(SensorPos_next)
@@ -266,6 +275,30 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         np.maximum(SensorPos_next[:, 2], za + minDistance + 0.5 * Rdiameter),
         zb - minDistance - 0.5 * Rdiameter,
     )
+
+    final_dists = np.asarray(esdf_map.get_esdf(SensorPos_next), dtype=float).reshape(-1)
+    final_bad = np.where(final_dists <= 0)[0]
+    if final_bad.size > 0:
+        original_dists = np.asarray(esdf_map.get_esdf(robots_positions), dtype=float).reshape(-1)
+        for ii in final_bad:
+            if original_dists[ii] > 0:
+                SensorPos_next[ii, :] = robots_positions[ii, :]
+                continue
+            grad = np.asarray(esdf_map.compute_gradient(SensorPos_next[ii, :]), dtype=float).reshape(-1)
+            if grad.shape[0] < 3:
+                continue
+            gn = float(np.linalg.norm(grad[:3]))
+            if gn < 1e-12:
+                continue
+            gu = grad[:3] / gn
+            for step_scale in (1.0, 1.5, 2.0, 3.0):
+                trial = SensorPos_next[ii, :] + gu * max_Velocity * step_scale
+                trial[0] = min(max(trial[0], xa + minDistance + 0.5 * Rdiameter), xb - minDistance - 0.5 * Rdiameter)
+                trial[1] = min(max(trial[1], ya + minDistance + 0.5 * Rdiameter), yb - minDistance - 0.5 * Rdiameter)
+                trial[2] = min(max(trial[2], za + minDistance + 0.5 * Rdiameter), zb - minDistance - 0.5 * Rdiameter)
+                if float(np.asarray(esdf_map.get_esdf(trial)).reshape(-1)[0]) > 0:
+                    SensorPos_next[ii, :] = trial
+                    break
 
     U_sensor_next_gmm = np.zeros(numAgent)
     for l in range(len(next_means)):

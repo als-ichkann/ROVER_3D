@@ -4,16 +4,20 @@ planning_node:
     odom_suffix: "global_odom"
     goal_topic: "goal_gmm"
     trajectory_suffix: "trajectory"
-    control_rate: 5.0
-    max_micro_try: 10
+    trajectory_marker_topic: "trajectory_markers"
+    trajectory_marker_line_width: 0.06
+    control_rate: 10.0
+    max_micro_try: 12
     gmm_interp_steps: 5
-    micro_goal_lock_radius: 0.25
+    micro_goal_lock_radius: 0.35
+    density_traj_steps: 20
     micro_controller: "apf"  # apf | density
-    slp_epsilon: 0.2
+    slp_epsilon: 1.2
     use_gmm_trajectory_slp: true
     esdf_mode: "shm"
     esdf_shm_name: "/fiesta_esdf"
     signed_sdf_enable: true
+    esdf_native_signed: true
     signed_sdf_occupied_eps: 1.0e-6
     signed_sdf_inside_offset_vox: 0.5
     esdf_frame_id: "map_origin"

@@ -141,7 +141,7 @@ def Optimization_SLP(
     Graph_GC,
     Wasserstein_table,
     Node_PDF_table,
-    robots_positions,
+    robots_positions=None,
     epsilon=0.2,
     min_weight=0.002,
     tau=1e-3,
@@ -152,6 +152,7 @@ def Optimization_SLP(
     max_slp_iter=30,
     fd_eps=1e-5,
     qp_solver="mosek",
+    use_em_from_odom=False,
 ):
     """
     说明
@@ -165,31 +166,37 @@ def Optimization_SLP(
     print("[0] 开始 Optimization_SLP")
 
     # --------------------------------------------------------
-    # Step 0: 基于当前 global/odom 的集群位置做 EM 拟合
+    # Step 0: 当前分布初始化（可选：基于 odom 的 EM 重估）
     # --------------------------------------------------------
-    robots_positions = np.asarray(robots_positions, dtype=float).reshape(-1, 3)
-    if robots_positions.shape[0] == 0:
-        raise ValueError("robots_positions 为空，无法进行 STEP0-EM")
+    current_means = np.asarray(current_means, dtype=float).reshape(-1, 3)
+    current_covs = np.asarray(current_covs, dtype=float).reshape(-1, 3, 3)
+    current_weights = _normalize_weights(np.asarray(current_weights, dtype=float))
 
-    current_means_in = np.asarray(current_means, dtype=float).reshape(-1, 3)
-    k_hint = int(current_means_in.shape[0])
-    k = max(1, min(k_hint, robots_positions.shape[0]))
-
-    em = GaussianMixture(
-        n_components=k,
-        covariance_type="full",
-        reg_covar=1e-6,
-        random_state=0,
-    )
-    em.fit(robots_positions)
-
-    current_means = np.asarray(em.means_, dtype=float)
-    current_covs = np.asarray(em.covariances_, dtype=float)
-    current_weights = _normalize_weights(em.weights_)
-    print(
-        f"[0] STEP0-EM done: samples={robots_positions.shape[0]}, "
-        f"K={k}, weights={current_weights.tolist()}"
-    )
+    if use_em_from_odom:
+        robots_positions = np.asarray(robots_positions, dtype=float).reshape(-1, 3)
+        if robots_positions.shape[0] == 0:
+            raise ValueError("robots_positions 为空，无法进行 STEP0-EM")
+        k_hint = int(current_means.shape[0])
+        k = max(1, min(k_hint, robots_positions.shape[0]))
+        em = GaussianMixture(
+            n_components=k,
+            covariance_type="full",
+            reg_covar=1e-6,
+            random_state=0,
+        )
+        em.fit(robots_positions)
+        current_means = np.asarray(em.means_, dtype=float)
+        current_covs = np.asarray(em.covariances_, dtype=float)
+        current_weights = _normalize_weights(em.weights_)
+        print(
+            f"[0] STEP0-EM done: samples={robots_positions.shape[0]}, "
+            f"K={k}, weights={current_weights.tolist()}"
+        )
+    else:
+        print(
+            f"[0] STEP0-EM skipped: use incoming current GMM, "
+            f"K={len(current_means)}, weights={current_weights.tolist()}"
+        )
 
     fmeans = np.asarray(fmeans, dtype=float)
     fcovs = np.asarray(fcovs, dtype=float)
@@ -323,6 +330,7 @@ def Optimization_SLP(
 
     PIa = initialize_path_flow(path_table, current_weights, fweights)
     PIa = np.clip(PIa, 0.0, 1.0)
+    solution = PIa.copy()
 
     print("[5] CVaR-SLP 迭代开始")
 
@@ -489,10 +497,11 @@ def Optimization_SLP(
         )
 
         if solution is None:
-            raise RuntimeError(
-                "QP 求解失败：solve_qp 返回 None，问题可能不可行。"
-                "请检查 PDF / CVaR / 边缘约束是否冲突。"
+            print(
+                "[6] QP infeasible: use previous path flow fallback. "
+                "PDF / CVaR / marginal constraints may be locally conflicting."
             )
+            break
 
         fval = 0.5 * np.dot(solution.T, np.dot(H, solution)) + np.dot(q, solution)
         time2 = time.time()

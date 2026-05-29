@@ -2,7 +2,7 @@
 """
 MPC Drone Control ROS2 Node
 
-订阅 odom（默认 global_odom）和 trajectory (apf_trajectory)，发布 cmd_vel (Twist)。
+订阅 odom（默认 global_odom）和 trajectory，发布 cmd_vel (Twist)。
 默认使用“基础控制模式”（P 速度跟踪 + 限速/限加速度）以适配 Gazebo 无人机速度控制插件。
 保留原 MPC 链路，可通过参数 simple_mode:=false 切换。
 """
@@ -31,13 +31,14 @@ class MPCDroneControlNode(Node):
         self.declare_parameter("min_speed", 0.0)
         self.declare_parameter("odom_suffix", "global_odom")
         self.declare_parameter("simple_mode", True)
-        self.declare_parameter("simple_kp_xy", 1.0)
-        self.declare_parameter("simple_kp_z", 1.2)
-        self.declare_parameter("simple_max_speed_xy", 0.9)
-        self.declare_parameter("simple_max_speed_z", 0.45)
-        self.declare_parameter("simple_max_accel", 1.5)
+        self.declare_parameter("simple_kp_xy", 0.85)
+        self.declare_parameter("simple_kp_z", 0.75)
+        self.declare_parameter("simple_max_speed_xy", 0.65)
+        self.declare_parameter("simple_max_speed_z", 0.25)
+        self.declare_parameter("simple_max_accel", 0.65)
         self.declare_parameter("simple_lookahead", 3)
-        self.declare_parameter("simple_goal_tolerance", 0.25)
+        self.declare_parameter("simple_goal_tolerance", 0.2)
+        self.declare_parameter("simple_cmd_smoothing_alpha", 0.55)
         self.declare_parameter("use_esdf", False)
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
         self.declare_parameter("esdf_frame_id", "map_origin")
@@ -62,6 +63,9 @@ class MPCDroneControlNode(Node):
         self._simple_max_accel = float(self.get_parameter("simple_max_accel").value)
         self._simple_lookahead = int(self.get_parameter("simple_lookahead").value)
         self._simple_goal_tolerance = float(self.get_parameter("simple_goal_tolerance").value)
+        self._simple_cmd_smoothing_alpha = float(
+            self.get_parameter("simple_cmd_smoothing_alpha").value
+        )
 
         # 共享状态
         self._lock = threading.Lock()
@@ -204,8 +208,10 @@ class MPCDroneControlNode(Node):
         goal = pts[-1]
         err = target - cur
         goal_dist = float(np.linalg.norm(goal - cur))
+        traj_span = float(np.linalg.norm(goal - pts[0]))
 
-        if goal_dist < self._simple_goal_tolerance:
+        # density 模式常给短时域局部轨迹：若轨迹整体仍有位移，不应因为“终点近”直接置零。
+        if goal_dist < self._simple_goal_tolerance and traj_span < self._simple_goal_tolerance:
             self._last_cmd_world[:] = 0.0
             return Twist()
 
@@ -232,6 +238,8 @@ class MPCDroneControlNode(Node):
         if dv_norm > max_dv:
             dv = dv / dv_norm * max_dv
             v_world = self._last_cmd_world + dv
+        alpha = float(np.clip(self._simple_cmd_smoothing_alpha, 0.0, 1.0))
+        v_world = alpha * v_world + (1.0 - alpha) * self._last_cmd_world
         self._last_cmd_world = v_world
 
         v_body = self._world_to_body_velocity(v_world, state[9])
