@@ -454,21 +454,39 @@ class AStarNavigator3D:
             out[i] = esdf_astar.project_to_free(self._esdf, out[i], margin)
         return out
 
+    def _linear_path(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
+        """Build a straight-line path ``(M, 3)`` from start to goal (inclusive)."""
+        s = _as_float_array(start, (3,))
+        g = _as_float_array(goal, (3,))
+        disp = float(np.linalg.norm(g - s))
+        if disp <= 1e-9:
+            return self.clip_bounds(np.vstack([s, g]))
+        steps = min(
+            self._traj_steps,
+            max(1, int(np.ceil(disp / self._max_step_size))),
+        )
+        alphas = np.linspace(0.0, 1.0, steps + 1)
+        pts = np.array([s + a * (g - s) for a in alphas[1:]], dtype=float)
+        path = np.vstack([s.reshape(1, 3), pts])
+        return self.clip_bounds(path)
+
     def plan_single(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
         """Plan one agent path; never raises.
 
         Priority: A* → straight-line resample → hover at start.
+        Returns path array of shape ``(M, 3)`` with ``M >= 2`` when possible.
         """
         s = _as_float_array(start, (3,))
-        g = self.project_to_free(_as_float_array(goal, (1, 3)))[0]
+        g = _as_float_array(goal, (3,))
         margin = self.effective_margin
 
         if self._use_astar and self._esdf is not None and self.esdf_ready:
+            g_proj = self.project_to_free(g.reshape(1, 3))[0]
             self.refresh_esdf()
             path = esdf_astar.astar_3d(
                 self._esdf,
                 s,
-                g,
+                g_proj,
                 safe_margin=margin,
                 max_iterations=self._max_iterations,
             )
@@ -480,11 +498,14 @@ class AStarNavigator3D:
                 )
                 safe = esdf_astar.sanitize_path(self._esdf, resampled, margin)
                 if safe.shape[0] >= 1:
-                    return self.clip_bounds(safe)
+                    out = self.clip_bounds(safe)
+                    if out.shape[0] == 1:
+                        out = np.vstack([s.reshape(1, 3), out])
+                    return out
 
-        # Fallback: direct arc-length resample (may clip through obstacles; stable).
-        linear = self._linear_resample(s[None, :], g[None, :])[0]
-        return self.clip_bounds(linear)
+        # Linear mode: clip to map only; do not project goals onto ground.
+        g = self.clip_bounds(g)
+        return self._linear_path(s, g)
 
     def plan_swarm(
         self,
@@ -654,11 +675,11 @@ class DensityController3D:
         affine = compute_mccann_affine_maps(sigma_a, sigma_b)
         next_pos = mccann_pushforward(x, src_idx, dst_idx, mu_a, mu_b, affine)
         next_pos = self._navigator.clip_bounds(next_pos)
-        next_pos = self._navigator.project_to_free(next_pos)
+        if self._navigator._use_astar:
+            next_pos = self._navigator.project_to_free(next_pos)
 
-        # --- Step 4: ESDF A* micro trajectories ---
+        # --- Step 4: micro trajectories (A* or straight-line) ---
         _, snapshots = self._navigator.plan_swarm(x, next_pos)
 
         self._component_idx = dst_idx.astype(int)
-        terminals = snapshots[-1] if snapshots else next_pos
-        return terminals, snapshots
+        return next_pos, snapshots

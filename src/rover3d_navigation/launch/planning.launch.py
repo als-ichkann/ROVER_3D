@@ -80,8 +80,8 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "publish_goal",
-                default_value="true",
-                description="启动后自动向 /goal_gmm 发布一次 GMM 目标（来自 goal_config_file）",
+                default_value="false",
+                description="启动后自动向 /goal_gmm 发布一次 GMM 目标；默认 false，需手动 publish_gmm_goal.py",
             ),
             DeclareLaunchArgument(
                 "goal_config_file",

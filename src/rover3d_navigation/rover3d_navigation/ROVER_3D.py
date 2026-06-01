@@ -184,7 +184,11 @@ def _weighted_gmm_center(means: list, weights: list) -> np.ndarray:
 class PlanningProcess:
     """
     ROS2 兼容规划进程：单步式 run_one_cycle 接口。
-    无多进程、无 MPC：仅做 GMM 优化 + 微观轨迹生成。
+
+    循环逻辑（macro ↔ micro）：
+    1. macro：Step0 EM（odom 重定位当前 GMM A）+ SLP 求下一宏观态 B
+    2. micro：density control + ESDF A* 规划 A→B 微观轨迹并发布一次
+    3. 各机 odom 到达轨迹终端后回到 macro，重复直至 SLP flag=1
     """
 
     def __init__(
@@ -244,6 +248,7 @@ class PlanningProcess:
             use_astar=self.density_use_astar,
             astar_safe_margin=self.density_astar_safe_margin,
             astar_robot_radius=self.density_astar_robot_radius,
+            astar_max_iterations=12_000,
         )
 
         cfg = _require_config_dir(config_dir)
@@ -299,21 +304,22 @@ class PlanningProcess:
         self.goalFlag = 1
         self.StopFlag = 0
         self.flag = 0
-        self.GMM: List[list] = []
-        # WStack: OT 传输矩阵栈，预留供 density OT 等下游使用
-        self.WStack: List = []
-        self.step = 0
         self.robots_positions_expected: Optional[np.ndarray] = None
         self.stop_flag = False
-
-    def _macro_state_for_slp(self) -> Tuple[list, list, list]:
-        """CVaR 回退 / SLP 输入参考：优先上一段插值末态，否则用最近一次宏观输出。"""
-        if len(self.GMM) > 0:
-            last_m, last_c, last_w = self.GMM[-1]
-            return [list(m) for m in last_m], list(last_c), list(last_w)
-        if getattr(self, "goal_means", None):
-            return list(self.goal_means), list(self.goal_covs), list(self.goal_weights)
-        return list(self.current_means), list(self.current_covs), list(self.current_weights)
+        # macro: SLP(A→B) + Step0 EM；micro: density+A* 执行一段轨迹
+        self._phase = "macro"
+        self._seg_src: Optional[Tuple[list, list, list]] = None
+        self._seg_dst: Optional[Tuple[list, list, list]] = None
+        self._micro_intended_targets: Optional[np.ndarray] = None
+        self._micro_start_positions: Optional[np.ndarray] = None
+        self._micro_wait_cycles: int = 0
+        self._micro_min_wait_cycles: int = 10  # 5Hz 下约 2s，避免发布后立即判完成
+        self._micro_traj_published = False
+        self._cached_trajectories: Optional[List[np.ndarray]] = None
+        self._micro_republish_every: int = 10
+        self.goal_means: list = []
+        self.goal_covs: list = []
+        self.goal_weights: list = []
 
     def _hold_trajectories(self, robots_positions: np.ndarray) -> List[np.ndarray]:
         """发布单点轨迹，令 MPC 保持当前位置。"""
@@ -337,21 +343,206 @@ class PlanningProcess:
                 pass
         return True
 
-    def _current_gmm_segment_target(self) -> Optional[np.ndarray]:
-        """当前宏观插值段末态的加权中心。"""
-        if len(self.GMM) == 0:
-            return None
-        last_m, _, last_w = self.GMM[-1]
-        return _weighted_gmm_center(last_m, last_w)
+    def _reset_micro_state(self) -> None:
+        self._micro_intended_targets = None
+        self._micro_start_positions = None
+        self._micro_wait_cycles = 0
+        self._micro_traj_published = False
+        self._cached_trajectories = None
 
-    def _swarm_reached_macro_segment_end(self, robots_positions: np.ndarray) -> bool:
-        """集群中心是否已到达当前宏观段终点（才允许触发下一轮 SLP）。"""
-        target = self._current_gmm_segment_target()
-        if target is None:
-            return True
-        center = np.mean(np.asarray(robots_positions, dtype=float).reshape(-1, 3), axis=0)
-        dist = float(np.linalg.norm(center - target))
-        return dist <= self.macro_replan_radius
+    def _micro_execution_done(self, robots_positions: np.ndarray) -> bool:
+        """各机 odom 是否到达 density 分配的 McCann 目标（须先执行一段轨迹）。"""
+        if self._micro_intended_targets is None or not self._micro_traj_published:
+            return False
+        if self._micro_wait_cycles < self._micro_min_wait_cycles:
+            return False
+
+        pos = np.asarray(robots_positions, dtype=float).reshape(-1, 3)
+        targets = np.asarray(self._micro_intended_targets, dtype=float).reshape(-1, 3)
+        if pos.shape[0] != targets.shape[0]:
+            return False
+
+        radius = self.micro_goal_lock_radius if self.micro_goal_lock_radius > 0 else self.macro_replan_radius
+        for i in range(pos.shape[0]):
+            if float(np.linalg.norm(pos[i] - targets[i])) > radius:
+                return False
+
+        if self._micro_start_positions is not None:
+            start = np.asarray(self._micro_start_positions, dtype=float).reshape(-1, 3)
+            max_goal_dist = float(
+                np.max(np.linalg.norm(targets - start, axis=1))
+            )
+            max_travel = float(
+                np.max(np.linalg.norm(pos - start, axis=1))
+            )
+            min_travel = min(0.20, max(radius * 0.5, 0.08))
+            if max_goal_dist > radius and max_travel < min_travel:
+                return False
+        return True
+
+    def _run_macro_slp(self, robots_positions: np.ndarray) -> Optional[List[np.ndarray]]:
+        """宏观一步：Step0 EM 重定位 + SLP，得到 GMM 态 A→B。"""
+        if not self._esdf_usable_for_planning():
+            print("[MACRO] ESDF 未就绪或为空图，跳过 SLP，原地 hold")
+            return self._hold_trajectories(robots_positions)
+
+        self.robots_positions_expected = np.array(robots_positions, copy=True)
+        rpe = self.robots_positions_expected
+
+        if not self.use_gmm_trajectory_slp:
+            self._seg_src = (
+                [list(m) for m in self.current_means],
+                [
+                    np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+                    for c in self.current_covs
+                ],
+                list(self.current_weights),
+            )
+            self._seg_dst = (list(self.fmeans), list(self.fcovs), list(self.fweights))
+            self.goal_means, self.goal_covs, self.goal_weights = self._seg_dst
+            self._phase = "micro"
+            self._reset_micro_state()
+            self._density_controller.reset()
+            self.goalFlag = 0
+            self.optimization_k += 1
+            print("[MACRO] 直连最终目标 GMM（未启用 SLP）")
+            return None
+
+        init_means = np.asarray(self.current_means, dtype=float)
+        init_covs = np.asarray(self.current_covs, dtype=float)
+        init_weights = np.asarray(self.current_weights, dtype=float)
+        em_k = max(1, min(self.num_robots, len(self.fmeans)))
+
+        (
+            self.goal_means,
+            self.goal_covs,
+            self.goal_weights,
+            self.current_means,
+            self.current_covs,
+            self.current_weights,
+            _transfer_matrix,
+            self.flag,
+        ) = Planning_3D.Optimization_SLP(
+            init_means,
+            init_covs,
+            init_weights,
+            self.fmeans,
+            self.fcovs,
+            self.fweights,
+            self.conbinedmeans_list,
+            self.conbinedcovs_list,
+            self.esdf_map,
+            self.alpha,
+            list(self.current_means),
+            list(self.current_covs),
+            list(self.current_weights),
+            self.Graph_GC,
+            self.Wasserstein_table,
+            self.Node_PDF_table,
+            robots_positions=rpe,
+            epsilon=self.slp_epsilon,
+            use_em_from_odom=True,
+            em_n_components=em_k,
+        )
+
+        if self.flag == -1:
+            print(
+                "[MACRO] SLP 路径表为空 (flag=-1)，保持当前 GMM 并 hold，"
+                "等待 ESDF/地图恢复后重试"
+            )
+            self.goalFlag = 1
+            return self._hold_trajectories(robots_positions)
+
+        if self.flag == 1:
+            self._seg_src = (
+                [list(m) for m in np.asarray(self.current_means, dtype=float).reshape(-1, 3)],
+                [
+                    np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+                    for c in self.current_covs
+                ],
+                list(self.current_weights),
+            )
+            self._seg_dst = (list(self.fmeans), list(self.fcovs), list(self.fweights))
+        else:
+            self._seg_src = (
+                [list(m) for m in np.asarray(self.current_means, dtype=float).reshape(-1, 3)],
+                [
+                    np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+                    for c in self.current_covs
+                ],
+                list(self.current_weights),
+            )
+            self._seg_dst = (
+                [list(m) for m in np.asarray(self.goal_means, dtype=float).reshape(-1, 3)],
+                [
+                    np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+                    for c in self.goal_covs
+                ],
+                list(self.goal_weights),
+            )
+
+        src_m, _, src_w = self._seg_src
+        dst_m, _, dst_w = self._seg_dst
+        print(
+            f"[MACRO] SLP 段 A→B: K_a={len(src_m)} w_a={src_w}, "
+            f"K_b={len(dst_m)} w_b={dst_w}, flag={self.flag}"
+        )
+        self._phase = "micro"
+        self._reset_micro_state()
+        self._density_controller.reset()
+        self.goalFlag = 0
+        self.optimization_k += 1
+        print("[MACRO] 下周期将执行 density 微观规划", flush=True)
+        return None
+
+    def _run_micro_density(self, robots_positions: np.ndarray) -> List[np.ndarray]:
+        """微观：density control + ESDF A*，从当前 odom 规划到宏观段 B。"""
+        if self._seg_src is None or self._seg_dst is None:
+            raise RuntimeError("micro phase without macro segment A→B")
+        src_m, src_c, src_w = self._seg_src
+        dst_m, dst_c, dst_w = self._seg_dst
+        pos = np.array(robots_positions, copy=True)
+
+        print(
+            f"[MICRO] 开始 density 微观规划 (A K={len(src_m)} → B K={len(dst_m)}) ...",
+            flush=True,
+        )
+
+        if self.micro_controller != "density":
+            self.robots_positions_expected, robots_positions_list, _, _, _ = apf_control_law.APF(
+                dst_m,
+                dst_c,
+                dst_w,
+                pos,
+                self.esdf_map,
+                MaxNumTry=self.max_micro_try,
+                apf_use_esdf=self.apf_use_esdf,
+            )
+            self._micro_intended_targets = np.array(robots_positions_list[-1], copy=True)
+        else:
+            intended, robots_positions_list = self._density_controller.step(
+                src_m,
+                src_c,
+                src_w,
+                dst_m,
+                dst_c,
+                dst_w,
+                pos,
+            )
+            self._micro_intended_targets = np.asarray(intended, dtype=float).reshape(-1, 3)
+
+        trajectories = []
+        for i in range(self.num_robots):
+            traj = np.array([pt[i] for pt in robots_positions_list])
+            trajectories.append(traj)
+        n_pts = sum(len(t) for t in trajectories)
+        print(
+            f"[MICRO] density 轨迹: {n_pts} waypoint(s), "
+            f"arrival_radius={self.micro_goal_lock_radius:.3f} m, "
+            f"targets={self._micro_intended_targets.round(2).tolist()}",
+            flush=True,
+        )
+        return trajectories
 
     def run_one_cycle(
         self, robots_positions: np.ndarray
@@ -368,189 +559,54 @@ class PlanningProcess:
         if self.robots_positions_expected is None:
             self.robots_positions_expected = np.array(robots_positions, copy=True)
 
-        # 若需要宏观优化
-        if self.goalFlag and not self.StopFlag:
-            if self.flag == 1:
-                self.StopFlag = 1
-                self.stop_flag = True
-                return None
-            if not self._esdf_usable_for_planning():
-                print("[MACRO] ESDF 未就绪或为空图，跳过 SLP，原地 hold")
-                return self._hold_trajectories(robots_positions), self.stop_flag
-            self.robots_positions_expected = np.array(robots_positions, copy=True)
-            rpe = self.robots_positions_expected
+        if self.StopFlag:
+            return None
 
-            if not self.use_gmm_trajectory_slp:
-                self.GMM = [[self.fmeans, self.fcovs, self.fweights]]
-                self.WStack = [np.eye(1)]
-                self.goalFlag = 0
-                self.optimization_k += 1
-                self.step = 0
-                self._density_controller.reset()
-            else:
-                # CVaR 超限时回退用的宏观参考；每拍 Step0 EM 会用实时 odom 重估 current
-                macro_means, macro_covs, macro_weights = self._macro_state_for_slp()
-                current_goal = [macro_means, macro_covs, macro_weights]
-                init_means = np.asarray(macro_means, dtype=float)
-                init_covs = np.asarray(macro_covs, dtype=float)
-                init_weights = np.asarray(macro_weights, dtype=float)
-                em_k = 1
+        # --- 宏观：EM + SLP，得到 A→B（下周期再做微观）---
+        if self._phase == "macro" and self.goalFlag:
+            hold = self._run_macro_slp(robots_positions)
+            if hold is not None:
+                return hold, self.stop_flag
+            return None
 
-                (
-                    self.goal_means,
-                    self.goal_covs,
-                    self.goal_weights,
-                    self.current_means,
-                    self.current_covs,
-                    self.current_weights,
-                    TransferMatrix,
-                    self.flag,
-                ) = Planning_3D.Optimization_SLP(
-                    init_means,
-                    init_covs,
-                    init_weights,
-                    self.fmeans,
-                    self.fcovs,
-                    self.fweights,
-                    self.conbinedmeans_list,
-                    self.conbinedcovs_list,
-                    self.esdf_map,
-                    self.alpha,
-                    current_goal[0],
-                    current_goal[1],
-                    current_goal[2],
-                    self.Graph_GC,
-                    self.Wasserstein_table,
-                    self.Node_PDF_table,
-                    robots_positions=rpe,
-                    epsilon=self.slp_epsilon,
-                    use_em_from_odom=True,
-                    em_n_components=em_k,
-                )
-                if self.flag == -1:
-                    print(
-                        "[MACRO] SLP 路径表为空 (flag=-1)，保持宏观态并原地 hold，"
-                        "等待 ESDF/地图恢复后重试"
+        # --- 微观：density+A*，轨迹走完后回到宏观 ---
+        if self._phase == "micro":
+            if self._micro_traj_published:
+                self._micro_wait_cycles += 1
+                if self._micro_execution_done(robots_positions):
+                    dists = np.linalg.norm(
+                        np.asarray(robots_positions, dtype=float).reshape(-1, 3)
+                        - self._micro_intended_targets,
+                        axis=1,
                     )
-                    self.goalFlag = 0
-                    self.step = 0
-                    if not self.GMM:
-                        cm = [list(m) for m in np.asarray(self.current_means, dtype=float).reshape(-1, 3)]
-                        cc = [
-                            np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
-                            for c in self.current_covs
-                        ]
-                        cw = list(self.current_weights)
-                        self.GMM = [[cm, cc, cw]]
-                        self.WStack = [np.eye(max(1, len(cm)))]
-                    return self._hold_trajectories(robots_positions), self.stop_flag
-                self.GMM, self.WStack = Planning_3D.interpGMM_PRM(
-                    self.current_means,
-                    self.current_covs,
-                    self.current_weights,
-                    self.goal_means,
-                    self.goal_covs,
-                    self.goal_weights,
-                    TransferMatrix,
-                    self.flag,
-                    interp_steps=self.gmm_interp_steps,
-                )
-                self.goalFlag = 0
-                self.optimization_k += 1
-                self.step = 0
-                self._density_controller.reset()
+                    print(
+                        "[MICRO] 微观轨迹执行完成 → 下一轮宏观 Step0 EM + SLP "
+                        f"(per-robot dist={np.round(dists, 3).tolist()})",
+                        flush=True,
+                    )
+                    self._phase = "macro"
+                    self.goalFlag = 1
+                    self._reset_micro_state()
+                    self._seg_src = None
+                    self._seg_dst = None
+                    if self.flag == 1:
+                        self.StopFlag = 1
+                        self.stop_flag = True
+                        print("[MACRO] 已到达最终目标 GMM，停止规划", flush=True)
+                    return None
 
-        if len(self.GMM) == 0:
-            return None
-        if self.step >= len(self.GMM):
-            if not self._swarm_reached_macro_segment_end(robots_positions):
-                target = self._current_gmm_segment_target()
-                center = np.mean(robots_positions, axis=0)
-                dist = float(np.linalg.norm(center - target)) if target is not None else -1.0
-                print(
-                    f"[MACRO] GMM 段已播完但集群未到位: center_dist={dist:.3f}, "
-                    f"need<={self.macro_replan_radius:.3f}, hold"
-                )
-                return self._hold_trajectories(robots_positions), self.stop_flag
-            self.goalFlag = 1
-            return None
-        next_m, next_c, next_w = self.GMM[self.step]
-        next_means = [list(m) for m in next_m]
-        next_covs = [np.asarray(c).reshape(3, 3) if np.size(c) == 9 else c for c in next_c]
-        next_weights = list(next_w)
+                if (
+                    self._cached_trajectories is not None
+                    and self._micro_wait_cycles % self._micro_republish_every == 0
+                ):
+                    return self._cached_trajectories, self.stop_flag
+                return None
 
-        # 每周期用实时 odom 作为微观轨迹起点。若沿用上一拍输出，多步开环会使
-        # 「等效位置」漂移，吸引势相对虚点计算，易出现全体朝某一象限偏航（与目标均值无关）。
-        self.robots_positions_expected = np.array(robots_positions, copy=True)
+            trajectories = self._run_micro_density(robots_positions)
+            self._micro_start_positions = np.array(robots_positions, copy=True)
+            self._micro_traj_published = True
+            self._micro_wait_cycles = 0
+            self._cached_trajectories = trajectories
+            return trajectories, self.stop_flag
 
-        # 仅在插值末步且集群中心接近最终目标 GC 时 hold，避免在中间宏观步误触发下一拍 SLP。
-        if (
-            self.micro_goal_lock_radius > 0
-            and self.step == len(self.GMM) - 1
-            and len(self.fmeans) > 0
-        ):
-            final_center = _weighted_gmm_center(self.fmeans, self.fweights)
-            swarm_center = np.mean(self.robots_positions_expected, axis=0)
-            center_dist = float(np.linalg.norm(swarm_center - final_center))
-            if center_dist <= self.micro_goal_lock_radius:
-                trajectories = [
-                    np.array([self.robots_positions_expected[i]], dtype=float)
-                    for i in range(self.num_robots)
-                ]
-                print(
-                    f"[MICRO] lock at final goal: step={self.step}, "
-                    f"center_dist={center_dist:.4f}, radius={self.micro_goal_lock_radius:.4f}"
-                )
-                self.step += 1
-                self.goalFlag = 1
-                return trajectories, self.stop_flag
-
-        if self.micro_controller == "apf":
-            self.robots_positions_expected, robots_positions_list, _, _, _ = apf_control_law.APF(
-                next_means,
-                next_covs,
-                next_weights,
-                self.robots_positions_expected,
-                self.esdf_map,
-                MaxNumTry=self.max_micro_try,
-                apf_use_esdf=self.apf_use_esdf,
-            )
-        else:
-            if self.step > 0 and self.step - 1 < len(self.GMM):
-                src_m, src_c, src_w = self.GMM[self.step - 1]
-            else:
-                src_m, src_c, src_w = self.current_means, self.current_covs, self.current_weights
-            next_pos, robots_positions_list = self._density_controller.step(
-                src_m,
-                src_c,
-                src_w,
-                next_means,
-                next_covs,
-                next_weights,
-                self.robots_positions_expected,
-            )
-            # 约束到地图边界；目标点需满足 ESDF 安全裕度
-            esdf_margin = self.density_astar_safe_margin + self.density_astar_robot_radius
-            next_pos[:, 0] = np.minimum(np.maximum(next_pos[:, 0], self.xa + 1e-6), self.xb - 1e-6)
-            next_pos[:, 1] = np.minimum(np.maximum(next_pos[:, 1], self.ya + 1e-6), self.yb - 1e-6)
-            next_pos[:, 2] = np.minimum(np.maximum(next_pos[:, 2], self.za + 1e-6), self.zb - 1e-6)
-            try:
-                d = self.esdf_map.get_esdf(next_pos)
-                d = np.asarray(d, dtype=float).reshape(-1)
-                bad = np.where(d < esdf_margin)[0]
-                if len(bad) > 0:
-                    next_pos[bad] = self.robots_positions_expected[bad]
-            except Exception:
-                pass
-            if robots_positions_list:
-                self.robots_positions_expected = np.array(robots_positions_list[-1], copy=True)
-            else:
-                self.robots_positions_expected = next_pos
-
-        trajectories = []
-        for i in range(self.num_robots):
-            traj = np.array([pos[i] for pos in robots_positions_list])
-            trajectories.append(traj)
-
-        self.step += 1
-        return trajectories, self.stop_flag
+        return None

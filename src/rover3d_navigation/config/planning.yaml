@@ -8,14 +8,14 @@ planning_node:
     trajectory_marker_line_width: 0.06
     control_rate: 5.0
     max_micro_try: 12
-    gmm_interp_steps: 8
-    micro_goal_lock_radius: 0.35
-    macro_replan_radius: 0.6  # 集群中心距当前宏观段终点 < 此值才触发下一轮 SLP
-    density_traj_steps: 12  # A* 重采样上限；步长约 max_step_size
-    density_use_astar: true  # density 微观段用 FIESTA ESDF A*
+    gmm_interp_steps: 8  # 保留参数；微观循环不再按插值步逐步播放
+    micro_goal_lock_radius: 0.35  # 微观轨迹终端到位判定半径 (m)
+    macro_replan_radius: 0.6  # 保留参数；宏观循环改由微观到位触发
+    density_traj_steps: 12  # 微观直线插值 waypoint 上限；步长约 max_step_size (0.08m)
+    density_use_astar: true  # false: density 分配目标 + 直线插值；true: FIESTA ESDF A*
     density_astar_safe_margin: 0.4  # A* 额外裕度 (m)，与 robot_radius 相加
     density_astar_robot_radius: 0.18  # 无人机等效半径 (m)，APF Rdiameter=0.35
-    micro_controller: "apf"  # apf | density
+    micro_controller: "density"  # apf | density
     apf_use_esdf: true  # APF 内 ESDF 障碍斥力/步长回退
     slp_epsilon: 1.2
     use_gmm_trajectory_slp: true

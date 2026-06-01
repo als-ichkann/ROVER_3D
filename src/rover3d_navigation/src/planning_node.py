@@ -197,7 +197,16 @@ class PlanningNode(Node):
             c = np.array(msg.covariances[start:end]).reshape(3, 3)
             covs.append(c)
         weights = list(msg.weights[:n])
-        self._gmm_goal = (means, covs, weights)
+        new_goal = (means, covs, weights)
+        if self._gmm_goal is not None:
+            old_means, old_covs, old_weights = self._gmm_goal
+            if (
+                len(means) == len(old_means)
+                and np.allclose(np.asarray(means), np.asarray(old_means), atol=1e-4)
+                and np.allclose(np.asarray(weights), np.asarray(old_weights), atol=1e-4)
+            ):
+                return
+        self._gmm_goal = new_goal
         self._planning_process = None
         self.get_logger().info(f"New GMM goal: {n} components")
         self.get_logger().info(f"Raw goal means={means}, weights={weights}")
