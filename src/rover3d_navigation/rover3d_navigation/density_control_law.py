@@ -1,5 +1,4 @@
 import numpy as np
-import heapq
 from scipy.linalg import sqrtm
 from scipy.optimize import linprog
 from scipy.stats import multivariate_normal
@@ -80,22 +79,23 @@ def _w2_cost_matrix(means_a, covs_a, means_b, covs_b) -> np.ndarray:
 
 
 class DensityController3D:
-    """Wasserstein density-control based micro trajectory stepper."""
+    """Wasserstein density-control based micro trajectory stepper.
+
+    每一步用最优传输的高斯仿射映射，为每架无人机算出其在目标 GMM 分布中的
+    对应位置 ``next_pos``，再对 ``current -> next_pos`` 做直线插值生成微观轨迹。
+    全局绕障由上层宏观规划（GMM + SLP 转移路径）负责，本类不做 A*。
+    """
 
     def __init__(
         self,
         seed: int = 0,
         traj_steps: int = 8,
         esdf_map=None,
-        safe_margin: float = 0.1,
-        use_astar_path: bool = True,
     ) -> None:
         self._rng = np.random.default_rng(seed)
         self._component_idx = None
         self._traj_steps = max(1, int(traj_steps))
         self._esdf = esdf_map
-        self._safe_margin = max(0.0, float(safe_margin))
-        self._use_astar_path = bool(use_astar_path and (esdf_map is not None))
         self._bounds_min = None
         self._bounds_max = None
         if esdf_map is not None:
@@ -112,258 +112,11 @@ class DensityController3D:
     def reset(self) -> None:
         self._component_idx = None
 
-    def _map_resolution(self) -> float:
-        if self._esdf is None:
-            return 0.1
-        try:
-            return max(float(getattr(self._esdf, "resolution", 0.1)), 1e-3)
-        except Exception:
-            return 0.1
-
     def _clip_bounds(self, pos: np.ndarray) -> np.ndarray:
         p = np.asarray(pos, dtype=float).reshape(-1, 3)
         if self._bounds_min is None or self._bounds_max is None:
             return p
         return np.minimum(np.maximum(p, self._bounds_min), self._bounds_max)
-
-    def _pos_to_index(self, pos: np.ndarray):
-        if self._esdf is None:
-            return None
-        try:
-            if hasattr(self._esdf, "pos_to_index"):
-                return tuple(self._esdf.pos_to_index(pos).astype(int).tolist())
-            origin = np.asarray(getattr(self._esdf, "origin"), dtype=float).reshape(3)
-            dims = np.asarray(getattr(self._esdf, "dims"), dtype=int).reshape(3)
-            res = self._map_resolution()
-            idx = np.floor((np.asarray(pos, dtype=float).reshape(3) - origin) / res).astype(int)
-            idx = np.minimum(np.maximum(idx, 0), dims - 1)
-            return tuple(idx.tolist())
-        except Exception:
-            return None
-
-    def _index_to_pos(self, idx):
-        if self._esdf is None:
-            return None
-        try:
-            if hasattr(self._esdf, "index_to_pos"):
-                return np.asarray(self._esdf.index_to_pos(np.asarray(idx, dtype=int)), dtype=float).reshape(3)
-            origin = np.asarray(getattr(self._esdf, "origin"), dtype=float).reshape(3)
-            res = self._map_resolution()
-            idx_arr = np.asarray(idx, dtype=float).reshape(3)
-            return origin + (idx_arr + 0.5) * res
-        except Exception:
-            return None
-
-    def _is_index_free(self, idx) -> bool:
-        if self._esdf is None:
-            return True
-        p = self._index_to_pos(idx)
-        if p is None:
-            return False
-        try:
-            return float(self._esdf.get_esdf(p)) >= self._safe_margin
-        except Exception:
-            return False
-
-    def _nearest_free_index(self, idx, max_radius: int = 4):
-        if self._esdf is None:
-            return idx
-        try:
-            dims = np.asarray(self._esdf.dims, dtype=int)
-            idx = tuple(np.asarray(idx, dtype=int).tolist())
-            if self._is_index_free(idx):
-                return idx
-            for r in range(1, int(max_radius) + 1):
-                best = None
-                best_score = np.inf
-                for dx in range(-r, r + 1):
-                    for dy in range(-r, r + 1):
-                        for dz in range(-r, r + 1):
-                            if max(abs(dx), abs(dy), abs(dz)) != r:
-                                continue
-                            cand = (idx[0] + dx, idx[1] + dy, idx[2] + dz)
-                            if not (
-                                0 <= cand[0] < dims[0]
-                                and 0 <= cand[1] < dims[1]
-                                and 0 <= cand[2] < dims[2]
-                            ):
-                                continue
-                            if not self._is_index_free(cand):
-                                continue
-                            score = float(dx * dx + dy * dy + dz * dz)
-                            if score < best_score:
-                                best_score = score
-                                best = cand
-                if best is not None:
-                    return best
-        except Exception:
-            return idx
-        return idx
-
-    def _fallback_path(self, start: np.ndarray, goal: np.ndarray):
-        if self._esdf is None:
-            return self._resample_polyline([start, goal], self._traj_steps)
-        try:
-            if (self._esdf.get_esdf(goal) >= self._safe_margin) and (
-                not self._esdf.is_collision_line_segment(start, goal, safe_margin=self._safe_margin)
-            ):
-                return self._resample_polyline([start, goal], self._traj_steps)
-        except Exception:
-            pass
-        return self._resample_polyline([start, start], self._traj_steps)
-
-    def _resample_polyline(self, points, min_samples: int):
-        pts = [np.asarray(p, dtype=float).reshape(3) for p in points]
-        if len(pts) == 0:
-            return []
-        if len(pts) == 1:
-            return [pts[0].copy() for _ in range(max(1, int(min_samples)))]
-
-        seg_lens = []
-        for i in range(1, len(pts)):
-            seg_lens.append(float(np.linalg.norm(pts[i] - pts[i - 1])))
-        total_len = float(np.sum(seg_lens))
-        if total_len <= 1e-9:
-            return [pts[-1].copy() for _ in range(max(1, int(min_samples)))]
-
-        res = float(getattr(self._esdf, "resolution", 0.1)) if self._esdf is not None else 0.1
-        spatial_samples = int(np.ceil(total_len / max(0.5 * res, 1e-3)))
-        n_out = max(int(min_samples), spatial_samples, 2)
-        targets = np.linspace(0.0, total_len, n_out)[1:]
-
-        out = []
-        cursor = 0
-        seg_start = pts[0]
-        seg_end = pts[1]
-        seg_acc = 0.0
-        cur_seg_len = seg_lens[0]
-        for d in targets:
-            while (cursor < len(seg_lens) - 1) and (d > seg_acc + cur_seg_len):
-                seg_acc += cur_seg_len
-                cursor += 1
-                seg_start = pts[cursor]
-                seg_end = pts[cursor + 1]
-                cur_seg_len = seg_lens[cursor]
-            alpha = (d - seg_acc) / max(cur_seg_len, 1e-9)
-            alpha = float(np.clip(alpha, 0.0, 1.0))
-            out.append(seg_start + alpha * (seg_end - seg_start))
-        return out
-
-    def _astar_path_one(self, start_pos: np.ndarray, goal_pos: np.ndarray):
-        if self._esdf is None:
-            return [np.asarray(goal_pos, dtype=float)]
-        if not self._use_astar_path:
-            return [np.asarray(goal_pos, dtype=float)]
-
-        start = np.asarray(start_pos, dtype=float).reshape(3)
-        goal = np.asarray(goal_pos, dtype=float).reshape(3)
-        if self._bounds_min is not None and self._bounds_max is not None:
-            start = np.minimum(np.maximum(start, self._bounds_min), self._bounds_max)
-            goal = np.minimum(np.maximum(goal, self._bounds_min), self._bounds_max)
-
-        try:
-            if (self._esdf.get_esdf(goal) >= self._safe_margin) and (
-                not self._esdf.is_collision_line_segment(start, goal, safe_margin=self._safe_margin)
-            ):
-                return self._resample_polyline([start, goal], self._traj_steps)
-        except Exception:
-            return self._fallback_path(start, goal)
-
-        try:
-            start_idx = self._pos_to_index(start)
-            goal_idx = self._pos_to_index(goal)
-            if start_idx is None or goal_idx is None:
-                return self._fallback_path(start, goal)
-
-            start_idx = self._nearest_free_index(start_idx, max_radius=2)
-            goal_idx = self._nearest_free_index(goal_idx, max_radius=6)
-            if start_idx == goal_idx:
-                end_pos = self._index_to_pos(goal_idx)
-                if end_pos is None:
-                    end_pos = goal
-                return self._resample_polyline([start, end_pos], self._traj_steps)
-
-            dims = np.asarray(self._esdf.dims, dtype=int)
-
-            def in_bounds(idx):
-                return (0 <= idx[0] < dims[0]) and (0 <= idx[1] < dims[1]) and (0 <= idx[2] < dims[2])
-
-            def traversable(idx):
-                return self._is_index_free(idx)
-
-            def heuristic(a, b):
-                d = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
-                return float(np.linalg.norm(d))
-
-            nbr_offsets = [
-                (dx, dy, dz)
-                for dx in (-1, 0, 1)
-                for dy in (-1, 0, 1)
-                for dz in (-1, 0, 1)
-                if not (dx == 0 and dy == 0 and dz == 0)
-            ]
-            open_heap = []
-            g_score = {start_idx: 0.0}
-            came_from = {}
-            heapq.heappush(open_heap, (heuristic(start_idx, goal_idx), 0.0, start_idx))
-            closed = set()
-            max_expand = 200000
-            expanded = 0
-            found = False
-            while open_heap and expanded < max_expand:
-                _, g_cur, cur = heapq.heappop(open_heap)
-                if cur in closed:
-                    continue
-                closed.add(cur)
-                expanded += 1
-                if cur == goal_idx:
-                    found = True
-                    break
-
-                for off in nbr_offsets:
-                    nxt = (cur[0] + off[0], cur[1] + off[1], cur[2] + off[2])
-                    if (not in_bounds(nxt)) or (nxt in closed) or (not traversable(nxt)):
-                        continue
-                    step_cost = float(np.linalg.norm(np.asarray(off, dtype=float)))
-                    tentative_g = g_cur + step_cost
-                    if tentative_g < g_score.get(nxt, np.inf):
-                        g_score[nxt] = tentative_g
-                        came_from[nxt] = cur
-                        f = tentative_g + heuristic(nxt, goal_idx)
-                        heapq.heappush(open_heap, (f, tentative_g, nxt))
-
-            if not found:
-                return self._fallback_path(start, goal)
-
-            path_idx = [goal_idx]
-            cur = goal_idx
-            while cur in came_from:
-                cur = came_from[cur]
-                path_idx.append(cur)
-            path_idx.reverse()
-
-            path = [self._index_to_pos(idx) for idx in path_idx[1:]]
-            path = [p for p in path if p is not None]
-            if len(path) == 0:
-                goal_proj = self._index_to_pos(goal_idx)
-                path = [goal_proj if goal_proj is not None else goal]
-            else:
-                last = np.asarray(path[-1], dtype=float)
-                res = self._map_resolution()
-                if np.linalg.norm(last - goal) > (0.5 * res):
-                    try:
-                        if (self._esdf.get_esdf(goal) >= self._safe_margin) and (
-                            not self._esdf.is_collision_line_segment(last, goal, safe_margin=self._safe_margin)
-                        ):
-                            path.append(goal)
-                    except Exception:
-                        pass
-                else:
-                    path[-1] = goal
-            full_path = [start] + [np.asarray(p, dtype=float) for p in path]
-            return self._resample_polyline(full_path, self._traj_steps)
-        except Exception:
-            return self._fallback_path(start, goal)
 
     def _estimate_component_responsibilities(self, positions, means, covs, weights):
         positions = np.asarray(positions, dtype=float).reshape(-1, 3)
@@ -444,35 +197,10 @@ class DensityController3D:
 
         return next_idx
 
-    def _pack_full_swarm_trajectory(self, start: np.ndarray, end: np.ndarray):
-        n_agents = start.shape[0]
-        robot_paths = []
-        max_len = 1
-        for i in range(n_agents):
-            if self._use_astar_path:
-                p = self._astar_path_one(start[i], end[i])
-            else:
-                p = [end[i]]
-            if len(p) == 0:
-                p = [end[i]]
-            path = [np.asarray(q, dtype=float).reshape(3) for q in p]
-            robot_paths.append(path)
-            max_len = max(max_len, len(path))
-
-        swarm_traj = []
-        for t in range(max_len):
-            frame = np.zeros((n_agents, 3), dtype=float)
-            for i in range(n_agents):
-                idx = min(t, len(robot_paths[i]) - 1)
-                frame[i] = robot_paths[i][idx]
-            swarm_traj.append(self._clip_bounds(frame))
-        return swarm_traj
-
     def make_trajectory(self, start_pos, end_pos):
+        """对 current -> next_pos 做直线插值，生成 traj_steps 个微观轨迹点。"""
         start = np.asarray(start_pos, dtype=float).reshape(-1, 3)
         end = np.asarray(end_pos, dtype=float).reshape(-1, 3)
-        if self._use_astar_path and self._esdf is not None:
-            return self._pack_full_swarm_trajectory(start, end)
         steps = max(1, int(self._traj_steps))
         alphas = np.linspace(0.0, 1.0, steps + 1)[1:]
         return [self._clip_bounds(start + a * (end - start)) for a in alphas]

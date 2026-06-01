@@ -231,6 +231,7 @@ class EsdfShmAdapter:
         self._grid_raw: Optional[np.ndarray] = None
         self._dist_grid: Optional[np.ndarray] = None
         self._ready = False
+        self._map_populated = False
         self._layout_version = 0
         self._source_is_signed_runtime = bool(source_is_signed)
 
@@ -297,8 +298,11 @@ class EsdfShmAdapter:
             else:
                 self._dist_grid = base_dist.copy()
 
-            self._ready = True
-            return True
+            # 仅当 ESDF 真正含有自由空间（存在正距离体素）时才视为就绪。
+            # FIESTA 启动早期写入的是全 0 空图，此时不应让规划/控制抢跑。
+            self._map_populated = bool(np.any(self._dist_grid > 0.0))
+            self._ready = self._map_populated
+            return self._ready
         except (OSError, struct.error, ValueError):
             return False
 

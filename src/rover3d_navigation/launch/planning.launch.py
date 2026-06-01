@@ -25,6 +25,8 @@ def _planning_setup(context, *args, **kwargs):
             executable="planning_node.py",
             name="planning_node",
             output="screen",
+            emulate_tty=True,
+            additional_env={"PYTHONUNBUFFERED": "1"},
             parameters=[config_file, {"robot_names": robot_names}],
         )
     ]

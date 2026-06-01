@@ -30,8 +30,8 @@ lidar:
     resolution: 0.2
   v_rays:
     samples: 64
-    min_angle: -0.4
-    max_angle: 0.3
+    min_angle: -0.785
+    max_angle: 0.785
     resolution: 0.2
   range_min: 0.12
   range_max: 30.0

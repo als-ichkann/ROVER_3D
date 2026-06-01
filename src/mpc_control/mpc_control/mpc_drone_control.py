@@ -39,7 +39,7 @@ class MPCDroneControlNode(Node):
         self.declare_parameter("simple_lookahead", 3)
         self.declare_parameter("simple_goal_tolerance", 0.2)
         self.declare_parameter("simple_cmd_smoothing_alpha", 0.55)
-        self.declare_parameter("use_esdf", False)
+        self.declare_parameter("use_esdf", True)
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
         self.declare_parameter("esdf_frame_id", "map_origin")
         self.declare_parameter("esdf_d_safe", 0.3)
@@ -49,7 +49,7 @@ class MPCDroneControlNode(Node):
         self.declare_parameter("map_size_x", 22.0)
         self.declare_parameter("map_size_y", 17.0)
         self.declare_parameter("map_size_z", 6.0)
-        self.declare_parameter("esdf_resolution", 0.15)
+        self.declare_parameter("esdf_resolution", 0.25)
         dt = float(self.get_parameter("control_dt").value)
         self._dt = dt
         self._control_frequency = float(self.get_parameter("control_frequency").value)

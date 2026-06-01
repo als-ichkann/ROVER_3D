@@ -38,7 +38,7 @@ def _mpc_control_setup(context, *args, **kwargs):
     simple_max_speed_z = LaunchConfiguration("simple_max_speed_z", default="0.25").perform(context)
     simple_max_accel = LaunchConfiguration("simple_max_accel", default="0.65").perform(context)
     simple_lookahead = LaunchConfiguration("simple_lookahead", default="3").perform(context)
-    simple_goal_tolerance = LaunchConfiguration("simple_goal_tolerance", default="0.2").perform(context)
+    simple_goal_tolerance = LaunchConfiguration("simple_goal_tolerance", default="0.05").perform(context)
     simple_cmd_smoothing_alpha = LaunchConfiguration("simple_cmd_smoothing_alpha", default="0.55").perform(context)
     esdf_mode = LaunchConfiguration("esdf_mode", default="shm").perform(context)
     esdf_shm_name = LaunchConfiguration("esdf_shm_name", default="/fiesta_esdf").perform(context)
@@ -101,7 +101,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument(
             "robots",
-            default_value="bot1,bot2,bot3",
+            default_value="bot1,bot2,bot3,bot4",
             description="逗号分隔的机器人命名空间，如 bot1,bot2,bot3",
         ),
         DeclareLaunchArgument(
@@ -156,7 +156,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "simple_goal_tolerance",
-            default_value="0.2",
+            default_value="0.05",
             description="基础控制终点停止阈值 [m]",
         ),
         DeclareLaunchArgument(
@@ -166,7 +166,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "use_esdf",
-            default_value="true",
+            default_value="false",
             description="是否启用 ESDF 避障不等式约束（零拷贝：shm 或 grid_cache）",
         ),
         DeclareLaunchArgument(

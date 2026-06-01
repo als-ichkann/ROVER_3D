@@ -42,15 +42,17 @@ class MapFusionNode(Node):
         self.declare_parameter('bot_prefix', 'bot')
         self.declare_parameter('bot_cloud_topic', '/cloud_registered')
         self.declare_parameter('bot_cloud_frame', 'world')
-        self.declare_parameter('publish_rate_hz', 0.5)
+        self.declare_parameter('publish_rate_hz', 10.0)
+        self.declare_parameter('publish_on_cloud_update', True)
+        self.declare_parameter('cloud_publish_min_interval_sec', 0.1)
         self.declare_parameter('combined_map_topic', '/global_downsampled_map')
         self.declare_parameter('origin_frame', 'map_origin')
         self.declare_parameter('voxel_leaf_size', 0.1)
         self.declare_parameter('filter_high_intensity', True)
-        self.declare_parameter('intensity_max_threshold', 1000.0)
+        self.declare_parameter('intensity_max_threshold', 900.0)
         self.declare_parameter('filter_body_points', True)
         self.declare_parameter('body_frame', 'base_link')
-        self.declare_parameter('body_filter_radius', 0.45)
+        self.declare_parameter('body_filter_radius', 0.75)
         self.declare_parameter('debug_profile', True)
         self.declare_parameter('debug_profile_every', 10)
 
@@ -60,6 +62,10 @@ class MapFusionNode(Node):
         self.origin_frame_id: str = str(self.get_parameter('origin_frame').value).lstrip('/')
         self.combined_map_topic: str = str(self.get_parameter('combined_map_topic').value)
         rate_hz: float = float(self.get_parameter('publish_rate_hz').value)
+        self.publish_on_cloud_update: bool = bool(self.get_parameter('publish_on_cloud_update').value)
+        self.cloud_publish_min_interval_sec: float = max(
+            0.0, float(self.get_parameter('cloud_publish_min_interval_sec').value)
+        )
         self.voxel_size: float = float(self.get_parameter('voxel_leaf_size').value)
         self.filter_high_intensity: bool = bool(self.get_parameter('filter_high_intensity').value)
         self.intensity_max_threshold: float = float(self.get_parameter('intensity_max_threshold').value)
@@ -69,6 +75,7 @@ class MapFusionNode(Node):
         self.debug_profile: bool = bool(self.get_parameter('debug_profile').value)
         self.debug_profile_every: int = int(self.get_parameter('debug_profile_every').value)
         self._profile_count: int = 0
+        self._last_cloud_publish_mono: float = 0.0
 
         self.bot_resolver = BotFrameResolver(self.bot_prefix)
         self.bots_dict: Dict[int, BotSub] = {}
@@ -121,7 +128,9 @@ class MapFusionNode(Node):
             f"cloud_topic=/{self.bot_prefix}<id>/{self.bot_cloud_topic}, voxel_size={self.voxel_size}, "
             f"filter_high_intensity={self.filter_high_intensity}, intensity_max_threshold={self.intensity_max_threshold}, "
             f"filter_body_points={self.filter_body_points}, body_frame={self.body_frame}, "
-            f"body_filter_radius={self.body_filter_radius}"
+            f"body_filter_radius={self.body_filter_radius}, "
+            f"publish_on_cloud_update={self.publish_on_cloud_update}, "
+            f"cloud_publish_min_interval_sec={self.cloud_publish_min_interval_sec}"
         )
 
     def _register_bot(self, bot_id: int | None) -> None:
@@ -150,7 +159,24 @@ class MapFusionNode(Node):
             xyz = xyz[mask]
         if xyz.size == 0:
             return
-        pts = voxelize_numpy(xyz, self.voxel_size)
+
+        extr = self._lookup_extrinsic(uid)
+        if extr is None:
+            return
+        R, t = extr
+        pts_origin = (xyz @ R.T + t).astype(np.float32, copy=False)
+
+        if self.filter_body_points:
+            body_centers: list[np.ndarray] = []
+            for bot_uid in self.bots_dict.keys():
+                center = self._lookup_body_position(bot_uid)
+                if center is not None:
+                    body_centers.append(center)
+            pts_origin = self._remove_points_near_centers(pts_origin, body_centers)
+            if pts_origin.size == 0:
+                return
+
+        pts = voxelize_numpy(pts_origin, self.voxel_size)
         if pts.size == 0:
             return
 
@@ -160,6 +186,9 @@ class MapFusionNode(Node):
 
         combined = pts if existing.size == 0 else np.concatenate((existing, pts), axis=0)
         self.local_maps[uid] = voxelize_numpy(combined, self.voxel_size)
+
+        if self.publish_on_cloud_update:
+            self._maybe_publish_global_map(force=True)
 
         if self.debug_profile:
             self._profile_count += 1
@@ -232,18 +261,12 @@ class MapFusionNode(Node):
             if pts is None or pts.size == 0:
                 continue
 
-            extr = self._lookup_extrinsic(uid)
-            if extr is None:
-                continue
-            R, t = extr
-
-            base_int = float(100 * (uid - 1))
-            transformed = pts @ R.T + t
-            transformed = transformed.astype(np.float32, copy=False)
+            transformed = pts.astype(np.float32, copy=False)
             if self.filter_body_points:
                 transformed = self._remove_points_near_centers(transformed, body_centers)
                 if transformed.size == 0:
                     continue
+            base_int = float(100 * (uid - 1))
             intensities = np.full((transformed.shape[0], 1), base_int, dtype=np.float32)
             combined = np.hstack((transformed, intensities))
             if merged_pts is None:
@@ -251,10 +274,15 @@ class MapFusionNode(Node):
             else:
                 merged_pts = np.concatenate((merged_pts, combined), axis=0)
 
-            # Collapse accumulated data back into single ndarray to bound growth
-            self.local_maps[uid] = pts
-
         return merged_pts
+
+    def _maybe_publish_global_map(self, force: bool = False) -> None:
+        if force and self.cloud_publish_min_interval_sec > 0.0:
+            now_mono = time.monotonic()
+            if (now_mono - self._last_cloud_publish_mono) < self.cloud_publish_min_interval_sec:
+                return
+            self._last_cloud_publish_mono = now_mono
+        self._publish_global_map()
 
     def _publish_global_map(self) -> None:
         t0 = time.perf_counter()

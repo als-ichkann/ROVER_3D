@@ -6,15 +6,16 @@ planning_node:
     trajectory_suffix: "trajectory"
     trajectory_marker_topic: "trajectory_markers"
     trajectory_marker_line_width: 0.06
-    control_rate: 10.0
+    control_rate: 5.0
     max_micro_try: 12
     gmm_interp_steps: 5
     micro_goal_lock_radius: 0.35
     density_traj_steps: 20
     micro_controller: "apf"  # apf | density
+    apf_use_esdf: true  # APF 内 ESDF 障碍斥力/步长回退
     slp_epsilon: 1.2
     use_gmm_trajectory_slp: true
-    esdf_mode: "shm"
+    esdf_mode: "shm"  # FIESTA 共享内存，供宏观 CVaR / APF 查询
     esdf_shm_name: "/fiesta_esdf"
     signed_sdf_enable: true
     esdf_native_signed: true
@@ -27,6 +28,6 @@ planning_node:
     map_size_x: 22.0
     map_size_y: 17.0
     map_size_z: 6.0
-    esdf_resolution: 0.2
+    esdf_resolution: 0.25
     # GC / Wasserstein / Graph 等仅由 config_dir 下预计算文件加载
     config_dir: ""

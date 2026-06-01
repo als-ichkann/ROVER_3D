@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from typing import List, Optional, Tuple
 
 import numpy as np
-from scipy.stats import multivariate_normal
 from sklearn.mixture import GaussianMixture
 
 from . import apf_control_law
@@ -105,29 +103,6 @@ def _normalize_weights(weights: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return w / s
 
 
-def _gmm_min_sensor_pdf(
-    means: list,
-    covs: list,
-    weights: list,
-    positions: np.ndarray,
-) -> float:
-    pts = np.asarray(positions, dtype=float).reshape(-1, 3)
-    if pts.shape[0] == 0 or len(means) == 0:
-        return 0.0
-    ws = _normalize_weights(np.asarray(weights, dtype=float))
-    mu = np.asarray(means, dtype=float).reshape(-1, 3)
-    total_pdf = np.zeros(pts.shape[0], dtype=float)
-    for k in range(mu.shape[0]):
-        try:
-            sigma = np.asarray(covs[k], dtype=float).reshape(3, 3)
-            pk = multivariate_normal(mean=mu[k], cov=sigma, allow_singular=True).pdf(pts)
-            total_pdf += ws[k] * np.asarray(pk, dtype=float)
-        except Exception:
-            continue
-    total_pdf = np.nan_to_num(total_pdf, nan=0.0, posinf=0.0, neginf=0.0)
-    return float(np.min(total_pdf)) if total_pdf.size > 0 else 0.0
-
-
 def _estimate_swarm_gmm_em(
     positions: np.ndarray,
     n_components: int,
@@ -195,6 +170,17 @@ def _load_precomputed_tables(config_dir: str) -> Tuple[list, list, np.ndarray, n
     return gc_means, gc_covs, w, pdf, graph_adj
 
 
+def _weighted_gmm_center(means: list, weights: list) -> np.ndarray:
+    means_np = np.asarray(means, dtype=float).reshape(-1, 3)
+    weights_np = np.asarray(weights, dtype=float).reshape(-1)
+    if means_np.shape[0] == 0:
+        return np.zeros(3, dtype=float)
+    if np.sum(weights_np) > 1e-12 and means_np.shape[0] == weights_np.shape[0]:
+        weights_np = weights_np / np.sum(weights_np)
+        return np.average(means_np, axis=0, weights=weights_np)
+    return np.mean(means_np, axis=0)
+
+
 class PlanningProcess:
     """
     ROS2 兼容规划进程：单步式 run_one_cycle 接口。
@@ -221,7 +207,9 @@ class PlanningProcess:
         slp_epsilon: float = 0.2,
         use_gmm_trajectory_slp: bool = True,
         micro_controller: str = "apf",
+        apf_use_esdf: bool = True,
         config_dir: Optional[str] = None,
+        initial_positions: Optional[np.ndarray] = None,
     ):
         self.num_robots = num_robots
         self.esdf_map = esdf_map
@@ -235,6 +223,7 @@ class PlanningProcess:
         self.slp_epsilon = float(slp_epsilon)
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
         self.micro_controller = str(micro_controller).lower().strip()
+        self.apf_use_esdf = bool(apf_use_esdf)
         if self.micro_controller not in ("apf", "density"):
             raise ValueError(
                 f"Unsupported micro_controller={micro_controller!r}, expected 'apf' or 'density'"
@@ -244,8 +233,6 @@ class PlanningProcess:
             seed=0,
             traj_steps=self.density_traj_steps,
             esdf_map=self.esdf_map,
-            safe_margin=0.1,
-            use_astar_path=True,
         )
 
         cfg = _require_config_dir(config_dir)
@@ -277,20 +264,45 @@ class PlanningProcess:
             _adj_to_graph(graph_load, Numnode)
         )
 
-        # 当前分布：从初始机器人位置估计
-        self.current_means = list(self.fmeans)
-        self.current_covs = list(self.fcovs)
-        self.current_weights = list(self.fweights)
+        # 当前分布：从初始机器人位置 EM 估计并投射到 GC 节点
+        if initial_positions is not None:
+            pts = np.asarray(initial_positions, dtype=float).reshape(-1, 3)
+            k = max(1, min(self.num_robots, len(self.fmeans)))
+            em_means, em_covs, em_weights = _estimate_swarm_gmm_em(pts, n_components=k)
+            self.current_means, self.current_covs, self.current_weights = _map_goals_to_nearest_gc(
+                em_means.tolist(),
+                [em_covs[i] for i in range(len(em_means))],
+                em_weights.tolist(),
+                self.GC_means,
+                self.GC_covs,
+            )
+            print(
+                f"[INIT] current GMM from swarm EM+GC: "
+                f"means={self.current_means}, weights={self.current_weights}"
+            )
+        else:
+            self.current_means = []
+            self.current_covs = []
+            self.current_weights = []
         self.optimization_k = 0
         self.goalFlag = 1
         self.StopFlag = 0
         self.flag = 0
         self.GMM: List[list] = []
+        # WStack: OT 传输矩阵栈，预留供 density OT 等下游使用
         self.WStack: List = []
         self.step = 0
         self.robots_positions_expected: Optional[np.ndarray] = None
         self.stop_flag = False
-        self.sensor_pdf_threshold = 1e-4
+
+    def _macro_state_for_slp(self) -> Tuple[list, list, list]:
+        """CVaR 回退 / SLP 输入参考：优先上一段插值末态，否则用最近一次宏观输出。"""
+        if len(self.GMM) > 0:
+            last_m, last_c, last_w = self.GMM[-1]
+            return [list(m) for m in last_m], list(last_c), list(last_w)
+        if getattr(self, "goal_means", None):
+            return list(self.goal_means), list(self.goal_covs), list(self.goal_weights)
+        return list(self.current_means), list(self.current_covs), list(self.current_weights)
 
     def run_one_cycle(
         self, robots_positions: np.ndarray
@@ -324,36 +336,13 @@ class PlanningProcess:
                 self.step = 0
                 self._density_controller.reset()
             else:
-                current_goal = [self.current_means, self.current_covs, self.current_weights]
-                if self.step < len(self.GMM) and len(self.GMM) > 0:
-                    prev = self.GMM[self.step - 1] if self.step > 0 else [self.current_means, self.current_covs, self.current_weights]
-                    if len(prev) >= 3:
-                        current_goal = prev
-
-                # 对齐旧版宏观规划逻辑：先判断当前机器人位置与上一拍宏观分布是否一致，
-                # 偏离过大时才用实时位置重估当前 GMM；否则直接沿用上一拍宏观分布。
-                init_means, init_covs, init_weights = (
-                    np.asarray(current_goal[0], dtype=float),
-                    np.asarray(current_goal[1], dtype=float),
-                    np.asarray(current_goal[2], dtype=float),
-                )
-                try:
-                    min_sensor_pdf = _gmm_min_sensor_pdf(
-                        init_means.tolist(),
-                        init_covs.tolist(),
-                        init_weights.tolist(),
-                        rpe,
-                    )
-                except Exception:
-                    min_sensor_pdf = 0.0
-                if min_sensor_pdf < self.sensor_pdf_threshold:
-                    try:
-                        em_means, em_covs, em_weights = _estimate_swarm_gmm_em(
-                            rpe, n_components=max(1, len(init_means))
-                        )
-                        init_means, init_covs, init_weights = em_means, em_covs, em_weights
-                    except Exception:
-                        pass
+                # CVaR 超限时回退用的宏观参考；每拍 Step0 EM 会用实时 odom 重估 current
+                macro_means, macro_covs, macro_weights = self._macro_state_for_slp()
+                current_goal = [macro_means, macro_covs, macro_weights]
+                init_means = np.asarray(macro_means, dtype=float)
+                init_covs = np.asarray(macro_covs, dtype=float)
+                init_weights = np.asarray(macro_weights, dtype=float)
+                em_k = 1
 
                 (
                     self.goal_means,
@@ -383,7 +372,8 @@ class PlanningProcess:
                     self.Node_PDF_table,
                     robots_positions=rpe,
                     epsilon=self.slp_epsilon,
-                    use_em_from_odom=False,
+                    use_em_from_odom=True,
+                    em_n_components=em_k,
                 )
                 self.GMM, self.WStack = Planning_3D.interpGMM_PRM(
                     self.current_means,
@@ -394,6 +384,7 @@ class PlanningProcess:
                     self.goal_weights,
                     TransferMatrix,
                     self.flag,
+                    interp_steps=self.gmm_interp_steps,
                 )
                 self.goalFlag = 0
                 self.optimization_k += 1
@@ -404,7 +395,7 @@ class PlanningProcess:
             return None
         if self.step >= len(self.GMM):
             self.goalFlag = 1
-            self.step = len(self.GMM) - 1
+            return None
         next_m, next_c, next_w = self.GMM[self.step]
         next_means = [list(m) for m in next_m]
         next_covs = [np.asarray(c).reshape(3, 3) if np.size(c) == 9 else c for c in next_c]
@@ -414,33 +405,27 @@ class PlanningProcess:
         # 「等效位置」漂移，吸引势相对虚点计算，易出现全体朝某一象限偏航（与目标均值无关）。
         self.robots_positions_expected = np.array(robots_positions, copy=True)
 
-        # 接近当前宏观目标时锁定当前位置，避免在吸引梯度接近 0 时被斥力继续推走。
+        # 仅在插值末步且集群中心接近最终目标 GC 时 hold，避免在中间宏观步误触发下一拍 SLP。
         if (
             self.micro_controller == "apf"
             and self.micro_goal_lock_radius > 0
-            and len(next_means) > 0
+            and self.step == len(self.GMM) - 1
+            and len(self.fmeans) > 0
         ):
-            weights_np = np.asarray(next_weights, dtype=float).reshape(-1)
-            means_np = np.asarray(next_means, dtype=float).reshape(-1, 3)
-            if np.sum(weights_np) > 1e-12 and means_np.shape[0] == weights_np.shape[0]:
-                weights_np = weights_np / np.sum(weights_np)
-                macro_center = np.average(means_np, axis=0, weights=weights_np)
-            else:
-                macro_center = np.mean(means_np, axis=0)
+            final_center = _weighted_gmm_center(self.fmeans, self.fweights)
             swarm_center = np.mean(self.robots_positions_expected, axis=0)
-            center_dist = float(np.linalg.norm(swarm_center - macro_center))
+            center_dist = float(np.linalg.norm(swarm_center - final_center))
             if center_dist <= self.micro_goal_lock_radius:
                 trajectories = [
                     np.array([self.robots_positions_expected[i]], dtype=float)
                     for i in range(self.num_robots)
                 ]
                 print(
-                    f"[MICRO] lock at macro target: step={self.step}, "
+                    f"[MICRO] lock at final goal: step={self.step}, "
                     f"center_dist={center_dist:.4f}, radius={self.micro_goal_lock_radius:.4f}"
                 )
-                if self.step == len(self.GMM) - 1:
-                    self.goalFlag = 1
                 self.step += 1
+                self.goalFlag = 1
                 return trajectories, self.stop_flag
 
         if self.micro_controller == "apf":
@@ -451,6 +436,7 @@ class PlanningProcess:
                 self.robots_positions_expected,
                 self.esdf_map,
                 MaxNumTry=self.max_micro_try,
+                apf_use_esdf=self.apf_use_esdf,
             )
         else:
             if self.step > 0 and self.step - 1 < len(self.GMM):

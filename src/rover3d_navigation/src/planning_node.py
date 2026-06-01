@@ -40,6 +40,7 @@ class PlanningNode(Node):
         self.declare_parameter("slp_epsilon", 0.2)
         self.declare_parameter("use_gmm_trajectory_slp", True)
         self.declare_parameter("micro_controller", "apf")
+        self.declare_parameter("apf_use_esdf", True)
         self.declare_parameter("esdf_mode", "shm")
         self.declare_parameter("esdf_shm_name", "/fiesta_esdf")
         self.declare_parameter("signed_sdf_enable", True)
@@ -53,7 +54,7 @@ class PlanningNode(Node):
         self.declare_parameter("map_size_x", 22.0)
         self.declare_parameter("map_size_y", 17.0)
         self.declare_parameter("map_size_z", 6.0)
-        self.declare_parameter("esdf_resolution", 0.15)
+        self.declare_parameter("esdf_resolution", 0.25)
         self.declare_parameter("config_dir", "")
 
         robot_names = self.get_parameter("robot_names").value
@@ -84,6 +85,7 @@ class PlanningNode(Node):
                 f"Invalid micro_controller={self._micro_controller}, fallback to 'apf'"
             )
             self._micro_controller = "apf"
+        self._apf_use_esdf = bool(self.get_parameter("apf_use_esdf").value)
         config_dir_param = str(self.get_parameter("config_dir").value)
         if config_dir_param:
             self._config_dir = config_dir_param
@@ -250,7 +252,9 @@ class PlanningNode(Node):
                 slp_epsilon=self._slp_epsilon,
                 use_gmm_trajectory_slp=self._use_gmm_trajectory_slp,
                 micro_controller=self._micro_controller,
+                apf_use_esdf=self._apf_use_esdf,
                 config_dir=self._config_dir,
+                initial_positions=robots_positions,
             )
 
         try:

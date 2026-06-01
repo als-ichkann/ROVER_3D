@@ -20,7 +20,15 @@ APF_OBSTACLE_WARN_PERIOD_SEC = 2.0
 _last_obstacle_warning_time = 0.0
 
 
-def APF(next_means, next_covs, next_weights, robots_positions, esdf_map, MaxNumTry=10):
+def APF(
+    next_means,
+    next_covs,
+    next_weights,
+    robots_positions,
+    esdf_map,
+    MaxNumTry=10,
+    apf_use_esdf=True,
+):
     n = 1
     J_rate = float("inf")
     J_rate_pre = float("inf")
@@ -29,7 +37,13 @@ def APF(next_means, next_covs, next_weights, robots_positions, esdf_map, MaxNumT
     while n <= MaxNumTry and J_rate > 1e-6:
         _ = time.time()
         robots_positions, J_rate, _, _ = agentControl_APF(
-            next_means, next_covs, next_weights, robots_positions, esdf_map, MaxNumTry
+            next_means,
+            next_covs,
+            next_weights,
+            robots_positions,
+            esdf_map,
+            MaxNumTry,
+            apf_use_esdf=apf_use_esdf,
         )
         robots_positions_list.append(robots_positions)
         _ = J_rate_pre - J_rate
@@ -39,7 +53,15 @@ def APF(next_means, next_covs, next_weights, robots_positions, esdf_map, MaxNumT
     return robots_positions, robots_positions_list, J_rate, numTry, diff_gmm_est_targ
 
 
-def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf_map, MaxNumTry):
+def agentControl_APF(
+    next_means,
+    next_covs,
+    next_weights,
+    robots_positions,
+    esdf_map,
+    MaxNumTry,
+    apf_use_esdf=True,
+):
     xa, ya, za = esdf_map.origin
     xb = xa + esdf_map.dims[0] * esdf_map.resolution
     yb = ya + esdf_map.dims[1] * esdf_map.resolution
@@ -112,22 +134,25 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
     num_agents = len(robots_positions)
     dim = 3
     dU_repulsion_sensor_obstacle = np.zeros((num_agents, dim))
-    esdf_distances = np.zeros(num_agents)
-    esdf_gradients = np.zeros((num_agents, dim))
-    for i, pos in enumerate(robots_positions):
-        d = esdf_map.get_esdf(pos)
-        esdf_distances[i] = d - Rradius
-        grad = esdf_map.compute_gradient(pos)
-        esdf_gradients[i] = grad if grad is not None else np.zeros(dim)
-    in_repulsion_zone = esdf_distances <= r_repulsion_obstacle
-    affected_agents = np.where(in_repulsion_zone)[0]
-    if affected_agents.size > 0:
-        safe_dists = np.maximum(esdf_distances[affected_agents], APF_ESDF_SAFE_DIST_MIN)
-        epsilon = 1e-10
-        scale_factors = (1 / (safe_dists + epsilon) - 1 / r_repulsion_obstacle) / (safe_dists**3 + epsilon)
-        repulsion_vectors = -scale_factors[:, np.newaxis] * esdf_gradients[affected_agents]
-        np.add.at(dU_repulsion_sensor_obstacle, (affected_agents, slice(None)), repulsion_vectors)
-    dU_repulsion_sensor_obstacle *= APF_ESDF_REPULSE_GAIN
+    if apf_use_esdf:
+        esdf_distances = np.zeros(num_agents)
+        esdf_gradients = np.zeros((num_agents, dim))
+        for i, pos in enumerate(robots_positions):
+            d = esdf_map.get_esdf(pos)
+            esdf_distances[i] = d - Rradius
+            grad = esdf_map.compute_gradient(pos)
+            esdf_gradients[i] = grad if grad is not None else np.zeros(dim)
+        in_repulsion_zone = esdf_distances <= r_repulsion_obstacle
+        affected_agents = np.where(in_repulsion_zone)[0]
+        if affected_agents.size > 0:
+            safe_dists = np.maximum(esdf_distances[affected_agents], APF_ESDF_SAFE_DIST_MIN)
+            epsilon = 1e-10
+            scale_factors = (1 / (safe_dists + epsilon) - 1 / r_repulsion_obstacle) / (
+                safe_dists**3 + epsilon
+            )
+            repulsion_vectors = -scale_factors[:, np.newaxis] * esdf_gradients[affected_agents]
+            np.add.at(dU_repulsion_sensor_obstacle, (affected_agents, slice(None)), repulsion_vectors)
+        dU_repulsion_sensor_obstacle *= APF_ESDF_REPULSE_GAIN
 
     Dist_sensor_boundary_Left = robots_positions[:, 0] - xa + minDistance - Rradius
     Dist_sensor_boundary_Right = xb - robots_positions[:, 0] + minDistance - Rradius
@@ -221,47 +246,48 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
                 dU[j, :] = rep_u[j, :]
     U = U_sensor_gmm + gamma * U_sensor
 
-    dists = np.asarray(esdf_map.get_esdf(robots_positions), dtype=float).reshape(-1)
-    if np.any(dists <= 0):
-        global _last_obstacle_warning_time
-        now = time.time()
-        if now - _last_obstacle_warning_time >= APF_OBSTACLE_WARN_PERIOD_SEC:
-            _last_obstacle_warning_time = now
-            print(
-                "There are some sensors in the obstacle areas!!! "
-                f"count={int(np.sum(dists <= 0))}, min_esdf={float(np.min(dists)):.4f}"
-            )
-
     SensorPos_next = robots_positions - dU * max_Velocity
-    dists = esdf_map.get_esdf(SensorPos_next)
-    indexSensor = np.where(dists <= 0)[0]
-    k = 1
-    while k <= 3 and not indexSensor.shape[0] == 0:
-        Velocity = max_Velocity * (1 / 2) ** k
-        SensorPos_next[indexSensor] = robots_positions[indexSensor] - dU[indexSensor] * Velocity
+    if apf_use_esdf:
+        dists = np.asarray(esdf_map.get_esdf(robots_positions), dtype=float).reshape(-1)
+        if np.any(dists <= 0):
+            global _last_obstacle_warning_time
+            now = time.time()
+            if now - _last_obstacle_warning_time >= APF_OBSTACLE_WARN_PERIOD_SEC:
+                _last_obstacle_warning_time = now
+                print(
+                    "There are some sensors in the obstacle areas!!! "
+                    f"count={int(np.sum(dists <= 0))}, min_esdf={float(np.min(dists)):.4f}"
+                )
+
         dists = esdf_map.get_esdf(SensorPos_next)
         indexSensor = np.where(dists <= 0)[0]
-        k += 1
+        k = 1
+        while k <= 3 and not indexSensor.shape[0] == 0:
+            Velocity = max_Velocity * (1 / 2) ** k
+            SensorPos_next[indexSensor] = robots_positions[indexSensor] - dU[indexSensor] * Velocity
+            dists = esdf_map.get_esdf(SensorPos_next)
+            indexSensor = np.where(dists <= 0)[0]
+            k += 1
 
-    if indexSensor.size > 0:
-        stuck = np.asarray(indexSensor, dtype=int).ravel()
-        SensorPos_next[stuck] = robots_positions[stuck]
-        for ii in stuck:
-            ga = dU_sensor_gmm[ii, :]
-            gn = float(np.linalg.norm(ga))
-            if gn < 1e-12:
-                continue
-            gu = ga / gn
-            for frac in (0.45, 0.28, 0.16, 0.09, 0.05):
-                trial = robots_positions[ii, :] - gu * (max_Velocity * frac)
-                d_try = esdf_map.get_esdf(trial)
-                if isinstance(d_try, np.ndarray):
-                    d_try = float(np.asarray(d_try).ravel()[0])
-                else:
-                    d_try = float(d_try)
-                if d_try > 0:
-                    SensorPos_next[ii, :] = trial
-                    break
+        if indexSensor.size > 0:
+            stuck = np.asarray(indexSensor, dtype=int).ravel()
+            SensorPos_next[stuck] = robots_positions[stuck]
+            for ii in stuck:
+                ga = dU_sensor_gmm[ii, :]
+                gn = float(np.linalg.norm(ga))
+                if gn < 1e-12:
+                    continue
+                gu = ga / gn
+                for frac in (0.45, 0.28, 0.16, 0.09, 0.05):
+                    trial = robots_positions[ii, :] - gu * (max_Velocity * frac)
+                    d_try = esdf_map.get_esdf(trial)
+                    if isinstance(d_try, np.ndarray):
+                        d_try = float(np.asarray(d_try).ravel()[0])
+                    else:
+                        d_try = float(d_try)
+                    if d_try > 0:
+                        SensorPos_next[ii, :] = trial
+                        break
 
     SensorPos_next[:, 0] = np.minimum(
         np.maximum(SensorPos_next[:, 0], xa + minDistance + 0.5 * Rdiameter),
@@ -276,29 +302,39 @@ def agentControl_APF(next_means, next_covs, next_weights, robots_positions, esdf
         zb - minDistance - 0.5 * Rdiameter,
     )
 
-    final_dists = np.asarray(esdf_map.get_esdf(SensorPos_next), dtype=float).reshape(-1)
-    final_bad = np.where(final_dists <= 0)[0]
-    if final_bad.size > 0:
-        original_dists = np.asarray(esdf_map.get_esdf(robots_positions), dtype=float).reshape(-1)
-        for ii in final_bad:
-            if original_dists[ii] > 0:
-                SensorPos_next[ii, :] = robots_positions[ii, :]
-                continue
-            grad = np.asarray(esdf_map.compute_gradient(SensorPos_next[ii, :]), dtype=float).reshape(-1)
-            if grad.shape[0] < 3:
-                continue
-            gn = float(np.linalg.norm(grad[:3]))
-            if gn < 1e-12:
-                continue
-            gu = grad[:3] / gn
-            for step_scale in (1.0, 1.5, 2.0, 3.0):
-                trial = SensorPos_next[ii, :] + gu * max_Velocity * step_scale
-                trial[0] = min(max(trial[0], xa + minDistance + 0.5 * Rdiameter), xb - minDistance - 0.5 * Rdiameter)
-                trial[1] = min(max(trial[1], ya + minDistance + 0.5 * Rdiameter), yb - minDistance - 0.5 * Rdiameter)
-                trial[2] = min(max(trial[2], za + minDistance + 0.5 * Rdiameter), zb - minDistance - 0.5 * Rdiameter)
-                if float(np.asarray(esdf_map.get_esdf(trial)).reshape(-1)[0]) > 0:
-                    SensorPos_next[ii, :] = trial
-                    break
+    if apf_use_esdf:
+        final_dists = np.asarray(esdf_map.get_esdf(SensorPos_next), dtype=float).reshape(-1)
+        final_bad = np.where(final_dists <= 0)[0]
+        if final_bad.size > 0:
+            original_dists = np.asarray(esdf_map.get_esdf(robots_positions), dtype=float).reshape(-1)
+            for ii in final_bad:
+                if original_dists[ii] > 0:
+                    SensorPos_next[ii, :] = robots_positions[ii, :]
+                    continue
+                grad = np.asarray(esdf_map.compute_gradient(SensorPos_next[ii, :]), dtype=float).reshape(-1)
+                if grad.shape[0] < 3:
+                    continue
+                gn = float(np.linalg.norm(grad[:3]))
+                if gn < 1e-12:
+                    continue
+                gu = grad[:3] / gn
+                for step_scale in (1.0, 1.5, 2.0, 3.0):
+                    trial = SensorPos_next[ii, :] + gu * max_Velocity * step_scale
+                    trial[0] = min(
+                        max(trial[0], xa + minDistance + 0.5 * Rdiameter),
+                        xb - minDistance - 0.5 * Rdiameter,
+                    )
+                    trial[1] = min(
+                        max(trial[1], ya + minDistance + 0.5 * Rdiameter),
+                        yb - minDistance - 0.5 * Rdiameter,
+                    )
+                    trial[2] = min(
+                        max(trial[2], za + minDistance + 0.5 * Rdiameter),
+                        zb - minDistance - 0.5 * Rdiameter,
+                    )
+                    if float(np.asarray(esdf_map.get_esdf(trial)).reshape(-1)[0]) > 0:
+                        SensorPos_next[ii, :] = trial
+                        break
 
     U_sensor_next_gmm = np.zeros(numAgent)
     for l in range(len(next_means)):

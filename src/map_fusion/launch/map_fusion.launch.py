@@ -20,13 +20,15 @@ def _launch_setup(context, *args, **kwargs):
             "bot_cloud_topic": "/cloud_registered",  # /<bot_prefix><i>/<bot_cloud_topic> PointCloud2
             "bot_cloud_frame": "world",             # <bot_prefix><i>/<bot_cloud_frame>
 
-            "publish_rate_hz": 0.5,
+            "publish_rate_hz": 5.0,
+            "publish_on_cloud_update": True,
+            "cloud_publish_min_interval_sec": 0.2,
             "voxel_leaf_size": 0.1,
             "filter_high_intensity": True,
-            "intensity_max_threshold": 1000.0,
+            "intensity_max_threshold": 900.0,
             "filter_body_points": True,
             "body_frame": "base_link",
-            "body_filter_radius": 0.45,
+            "body_filter_radius": 0.75,
 
             "combined_map_topic": "/global_downsampled_map",
             "origin_frame": "map_origin",

@@ -29,6 +29,43 @@ def _to_pruned_csc(mat: np.ndarray, zero_eps: float = 1e-9) -> scipy.sparse.csc_
     return sp
 
 
+def _map_gmm_to_nearest_gc(
+    gmm_means: list,
+    gmm_covs: list,
+    gmm_weights: list,
+    gc_means: list,
+    gc_covs: list,
+) -> tuple:
+    """将 GMM 分量映射到最近的离散 GC 节点，合并同节点权重并采用 GC 协方差。"""
+    if not gmm_means or not gc_means:
+        return [], [], []
+
+    gm_arr = np.asarray(gmm_means, dtype=float).reshape(-1, 3)
+    gc_arr = np.asarray(gc_means, dtype=float).reshape(-1, 3)
+    weights = list(gmm_weights) if gmm_weights else [1.0] * len(gmm_means)
+    while len(weights) < len(gmm_means):
+        weights.append(1.0)
+    weights = weights[: len(gmm_means)]
+
+    from collections import defaultdict
+
+    merged: dict = defaultdict(float)
+    for i, gm in enumerate(gm_arr):
+        dists = np.linalg.norm(gc_arr - gm, axis=1)
+        best_idx = int(np.argmin(dists))
+        merged[best_idx] += weights[i]
+
+    idx_order = sorted(merged.keys())
+    fmeans = [list(gc_means[i]) for i in idx_order]
+    fcovs = [
+        np.asarray(gc_covs[i]).reshape(3, 3) if np.size(gc_covs[i]) == 9 else gc_covs[i]
+        for i in idx_order
+    ]
+    total_w = sum(merged.values())
+    fweights = [merged[i] / total_w for i in idx_order]
+    return fmeans, fcovs, fweights
+
+
 def build_weight_map(path_table, node_indices, col_id, num_variable):
     """
     构造线性映射矩阵 M，使得:
@@ -153,6 +190,7 @@ def Optimization_SLP(
     fd_eps=1e-5,
     qp_solver="mosek",
     use_em_from_odom=False,
+    em_n_components=None,
 ):
     """
     说明
@@ -176,8 +214,10 @@ def Optimization_SLP(
         robots_positions = np.asarray(robots_positions, dtype=float).reshape(-1, 3)
         if robots_positions.shape[0] == 0:
             raise ValueError("robots_positions 为空，无法进行 STEP0-EM")
-        k_hint = int(current_means.shape[0])
-        k = max(1, min(k_hint, robots_positions.shape[0]))
+        if em_n_components is None:
+            k = max(1, min(int(current_means.shape[0]), robots_positions.shape[0]))
+        else:
+            k = max(1, min(int(em_n_components), robots_positions.shape[0]))
         em = GaussianMixture(
             n_components=k,
             covariance_type="full",
@@ -185,12 +225,24 @@ def Optimization_SLP(
             random_state=0,
         )
         em.fit(robots_positions)
-        current_means = np.asarray(em.means_, dtype=float)
-        current_covs = np.asarray(em.covariances_, dtype=float)
-        current_weights = _normalize_weights(em.weights_)
+        em_means = np.asarray(em.means_, dtype=float)
+        em_covs = np.asarray(em.covariances_, dtype=float)
+        em_weights = _normalize_weights(em.weights_)
+        gc_means, gc_covs, gc_weights = _map_gmm_to_nearest_gc(
+            em_means.tolist(),
+            [em_covs[i] for i in range(len(em_means))],
+            em_weights.tolist(),
+            conbinedmeans_list,
+            conbinedcovs_list,
+        )
+        current_means = np.asarray(gc_means, dtype=float).reshape(-1, 3)
+        current_covs = np.asarray(
+            [np.asarray(c).reshape(3, 3) for c in gc_covs], dtype=float
+        )
+        current_weights = _normalize_weights(np.asarray(gc_weights, dtype=float))
         print(
             f"[0] STEP0-EM done: samples={robots_positions.shape[0]}, "
-            f"K={k}, weights={current_weights.tolist()}"
+            f"K={k}, weights={current_weights.tolist()}, projected_to_GC=True"
         )
     else:
         print(
@@ -286,15 +338,18 @@ def Optimization_SLP(
     print(f"[4] 路径表完成，耗时 {time.time() - start:.2f}s")
 
     if path_table.shape[0] == 0:
-        print("[4] 路径表为空（无可达路径），回退为直达目标")
-        _, W, _ = calWGMetric_speedUp(
+        print("[4] 路径表为空（无可达路径），回退为直达目标（继续规划，未到达）")
+        _, W_ot, _ = calWGMetric_speedUp(
             current_means, current_covs, current_weights,
             fmeans, fcovs, fweights
         )
+        num_p = len(current_means)
+        num_q = len(fmeans)
+        W_tm = np.asarray(W_ot, dtype=float).reshape((num_q, num_p), order="F").T
         return (
             fmeans, fcovs, fweights,
             current_means, current_covs, current_weights,
-            W, 1
+            W_tm, 0
         )
 
     # --------------------------------------------------------
@@ -534,7 +589,7 @@ def Optimization_SLP(
     # --------------------------------------------------------
     # Step 7: 根据最终流量构建 TransferMatrix
     # --------------------------------------------------------
-    W = solution
+    W = PIa if solution is None else solution
     TransferMatrix = np.zeros((len(current_means), len(conbinedmeans_list)))
 
     for n in range(len(index_next_gc)):
@@ -579,12 +634,11 @@ def Optimization_SLP(
 
     total_weights = np.sum(next_weight)
     if total_weights <= 1e-12:
-        # 兜底：若优化后无有效下一步分量，则退回目标
+        # 兜底：若优化后无有效下一步分量，则退回目标（尚未到达，flag 保持 0）
         print("[8] 无有效下一步 GMM，fallback to target")
         next_mu = fmeans
         next_sigma = fcovs
         next_weight = fweights
-        flag = 1
     else:
         next_weight = [w / total_weights for w in next_weight]
 
@@ -604,16 +658,44 @@ def Optimization_SLP(
     )
 
 
-def interpGMM_PRM(means1, covs1, weights1, means2, covs2, weights2, TransferMatrix, flag):
-    delDist = 0.2
+def _coerce_ot_plan(W, n_src: int, n_dst: int) -> np.ndarray:
+    """将 OT 计划转为 (n_src, n_dst) 矩阵，兼容路径表回退时的 1D 展平结果。"""
+    arr = np.asarray(W, dtype=float)
+    if arr.ndim == 1:
+        if arr.size == n_src * n_dst:
+            return arr.reshape((n_src, n_dst), order="F")
+        raise ValueError(
+            f"OT plan length {arr.size} != n_src*n_dst ({n_src * n_dst})"
+        )
+    if arr.shape == (n_src, n_dst):
+        return arr
+    if arr.shape[0] == n_src:
+        nz_cols = np.where(np.any(arr != 0, axis=0))[0]
+        trimmed = arr[:, nz_cols]
+        if trimmed.shape[1] == n_dst:
+            return trimmed
+    raise ValueError(f"Cannot coerce OT plan shape {arr.shape} to ({n_src}, {n_dst})")
+
+
+def interpGMM_PRM(
+    means1, covs1, weights1, means2, covs2, weights2, TransferMatrix, flag, interp_steps=5
+):
     dimW = 3
+    n_src, n_dst = len(means1), len(means2)
     WG_sq, W, _ = calWGMetric_speedUp(means1, covs1, weights1, means2, covs2, weights2)
     d = np.sqrt(WG_sq)
-    numPoint = math.ceil(d / delDist)
-    W = TransferMatrix
-    if flag == 1:
-        W = W.reshape((len(means1), len(means2)), order='F')
-        W = np.delete(W, np.where(np.all(W == 0, axis=0))[0], axis=1)
+    steps = max(1, int(interp_steps))
+    if d > 1e-12:
+        delDist = d / steps
+        numPoint = max(1, math.ceil(d / delDist))
+    else:
+        numPoint = 1
+    try:
+        W = _coerce_ot_plan(TransferMatrix, n_src, n_dst)
+    except ValueError:
+        W = np.asarray(W, dtype=float).reshape((n_dst, n_src), order="F").T
+    if flag == 1 and W.ndim == 1:
+        W = W.reshape((n_src, n_dst), order="F")
     GMM = []
     WStack = []
     if numPoint <= 1:
@@ -622,9 +704,15 @@ def interpGMM_PRM(means1, covs1, weights1, means2, covs2, weights2, TransferMatr
         return GMM, WStack
     t = np.linspace(0, 1, numPoint + 1)
     t = t[1:]
-    W = np.delete(W, np.where(np.all(W == 0, axis=0))[0], axis=1)
+    if W.ndim == 2 and W.shape[1] > 0:
+        W = np.delete(W, np.where(np.all(W == 0, axis=0))[0], axis=1)
     idxListW = np.where(W.flatten(order='F') > 0)[0]
     numComponent_p = idxListW.shape[0]
+    if numComponent_p == 0:
+        GMM.append([means2, covs2, weights2])
+        WStack.append(W)
+        print(f"[8] 插值 GMM 生成完成: {len(GMM)} 步 (empty OT plan, use goal)")
+        return GMM, WStack
     W_0 = np.zeros((len(means1), numComponent_p))
     W_1 = np.zeros((numComponent_p, len(means2)))
     Weight = np.zeros(numComponent_p)
