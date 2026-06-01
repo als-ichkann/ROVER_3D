@@ -203,7 +203,11 @@ class PlanningProcess:
         gmm_interp_steps: int = 5,
         max_micro_try: int = 10,
         micro_goal_lock_radius: float = 0.25,
+        macro_replan_radius: float = 0.6,
         density_traj_steps: int = 8,
+        density_use_astar: bool = True,
+        density_astar_safe_margin: float = 0.4,
+        density_astar_robot_radius: float = 0.18,
         slp_epsilon: float = 0.2,
         use_gmm_trajectory_slp: bool = True,
         micro_controller: str = "apf",
@@ -219,7 +223,11 @@ class PlanningProcess:
         self.gmm_interp_steps = gmm_interp_steps
         self.max_micro_try = int(max_micro_try)
         self.micro_goal_lock_radius = max(0.0, float(micro_goal_lock_radius))
+        self.macro_replan_radius = max(0.05, float(macro_replan_radius))
         self.density_traj_steps = max(1, int(density_traj_steps))
+        self.density_use_astar = bool(density_use_astar)
+        self.density_astar_safe_margin = max(0.0, float(density_astar_safe_margin))
+        self.density_astar_robot_radius = max(0.05, float(density_astar_robot_radius))
         self.slp_epsilon = float(slp_epsilon)
         self.use_gmm_trajectory_slp = use_gmm_trajectory_slp
         self.micro_controller = str(micro_controller).lower().strip()
@@ -233,6 +241,9 @@ class PlanningProcess:
             seed=0,
             traj_steps=self.density_traj_steps,
             esdf_map=self.esdf_map,
+            use_astar=self.density_use_astar,
+            astar_safe_margin=self.density_astar_safe_margin,
+            astar_robot_radius=self.density_astar_robot_radius,
         )
 
         cfg = _require_config_dir(config_dir)
@@ -304,6 +315,44 @@ class PlanningProcess:
             return list(self.goal_means), list(self.goal_covs), list(self.goal_weights)
         return list(self.current_means), list(self.current_covs), list(self.current_weights)
 
+    def _hold_trajectories(self, robots_positions: np.ndarray) -> List[np.ndarray]:
+        """发布单点轨迹，令 MPC 保持当前位置。"""
+        pos = np.asarray(robots_positions, dtype=float).reshape(-1, 3)
+        return [np.array([pos[i]], dtype=float) for i in range(self.num_robots)]
+
+    def _esdf_usable_for_planning(self) -> bool:
+        """ESDF 须已就绪且栅格中存在自由空间（非全零空图）。"""
+        if self.esdf_map is None:
+            return False
+        if hasattr(self.esdf_map, "refresh"):
+            self.esdf_map.refresh()
+        if hasattr(self.esdf_map, "is_ready") and not self.esdf_map.is_ready:
+            return False
+        grid = getattr(self.esdf_map, "_dist_grid", None)
+        if grid is not None:
+            try:
+                if not bool(np.any(np.asarray(grid, dtype=float) > 0.0)):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _current_gmm_segment_target(self) -> Optional[np.ndarray]:
+        """当前宏观插值段末态的加权中心。"""
+        if len(self.GMM) == 0:
+            return None
+        last_m, _, last_w = self.GMM[-1]
+        return _weighted_gmm_center(last_m, last_w)
+
+    def _swarm_reached_macro_segment_end(self, robots_positions: np.ndarray) -> bool:
+        """集群中心是否已到达当前宏观段终点（才允许触发下一轮 SLP）。"""
+        target = self._current_gmm_segment_target()
+        if target is None:
+            return True
+        center = np.mean(np.asarray(robots_positions, dtype=float).reshape(-1, 3), axis=0)
+        dist = float(np.linalg.norm(center - target))
+        return dist <= self.macro_replan_radius
+
     def run_one_cycle(
         self, robots_positions: np.ndarray
     ) -> Optional[Tuple[List[np.ndarray], bool]]:
@@ -325,6 +374,9 @@ class PlanningProcess:
                 self.StopFlag = 1
                 self.stop_flag = True
                 return None
+            if not self._esdf_usable_for_planning():
+                print("[MACRO] ESDF 未就绪或为空图，跳过 SLP，原地 hold")
+                return self._hold_trajectories(robots_positions), self.stop_flag
             self.robots_positions_expected = np.array(robots_positions, copy=True)
             rpe = self.robots_positions_expected
 
@@ -375,6 +427,23 @@ class PlanningProcess:
                     use_em_from_odom=True,
                     em_n_components=em_k,
                 )
+                if self.flag == -1:
+                    print(
+                        "[MACRO] SLP 路径表为空 (flag=-1)，保持宏观态并原地 hold，"
+                        "等待 ESDF/地图恢复后重试"
+                    )
+                    self.goalFlag = 0
+                    self.step = 0
+                    if not self.GMM:
+                        cm = [list(m) for m in np.asarray(self.current_means, dtype=float).reshape(-1, 3)]
+                        cc = [
+                            np.asarray(c).reshape(3, 3) if np.size(c) == 9 else np.asarray(c)
+                            for c in self.current_covs
+                        ]
+                        cw = list(self.current_weights)
+                        self.GMM = [[cm, cc, cw]]
+                        self.WStack = [np.eye(max(1, len(cm)))]
+                    return self._hold_trajectories(robots_positions), self.stop_flag
                 self.GMM, self.WStack = Planning_3D.interpGMM_PRM(
                     self.current_means,
                     self.current_covs,
@@ -394,6 +463,15 @@ class PlanningProcess:
         if len(self.GMM) == 0:
             return None
         if self.step >= len(self.GMM):
+            if not self._swarm_reached_macro_segment_end(robots_positions):
+                target = self._current_gmm_segment_target()
+                center = np.mean(robots_positions, axis=0)
+                dist = float(np.linalg.norm(center - target)) if target is not None else -1.0
+                print(
+                    f"[MACRO] GMM 段已播完但集群未到位: center_dist={dist:.3f}, "
+                    f"need<={self.macro_replan_radius:.3f}, hold"
+                )
+                return self._hold_trajectories(robots_positions), self.stop_flag
             self.goalFlag = 1
             return None
         next_m, next_c, next_w = self.GMM[self.step]
@@ -407,8 +485,7 @@ class PlanningProcess:
 
         # 仅在插值末步且集群中心接近最终目标 GC 时 hold，避免在中间宏观步误触发下一拍 SLP。
         if (
-            self.micro_controller == "apf"
-            and self.micro_goal_lock_radius > 0
+            self.micro_goal_lock_radius > 0
             and self.step == len(self.GMM) - 1
             and len(self.fmeans) > 0
         ):
@@ -452,26 +529,28 @@ class PlanningProcess:
                 next_weights,
                 self.robots_positions_expected,
             )
-            # 约束到地图边界，并在明显碰撞时回退到当前位置
+            # 约束到地图边界；目标点需满足 ESDF 安全裕度
+            esdf_margin = self.density_astar_safe_margin + self.density_astar_robot_radius
             next_pos[:, 0] = np.minimum(np.maximum(next_pos[:, 0], self.xa + 1e-6), self.xb - 1e-6)
             next_pos[:, 1] = np.minimum(np.maximum(next_pos[:, 1], self.ya + 1e-6), self.yb - 1e-6)
             next_pos[:, 2] = np.minimum(np.maximum(next_pos[:, 2], self.za + 1e-6), self.zb - 1e-6)
             try:
                 d = self.esdf_map.get_esdf(next_pos)
                 d = np.asarray(d, dtype=float).reshape(-1)
-                bad = np.where(d <= 0.0)[0]
+                bad = np.where(d < esdf_margin)[0]
                 if len(bad) > 0:
                     next_pos[bad] = self.robots_positions_expected[bad]
             except Exception:
                 pass
-            self.robots_positions_expected = next_pos
+            if robots_positions_list:
+                self.robots_positions_expected = np.array(robots_positions_list[-1], copy=True)
+            else:
+                self.robots_positions_expected = next_pos
 
         trajectories = []
         for i in range(self.num_robots):
             traj = np.array([pos[i] for pos in robots_positions_list])
             trajectories.append(traj)
 
-        if self.step == len(self.GMM) - 1:
-            self.goalFlag = 1
         self.step += 1
         return trajectories, self.stop_flag

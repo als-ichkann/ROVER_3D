@@ -36,7 +36,11 @@ class PlanningNode(Node):
         self.declare_parameter("max_micro_try", 10)
         self.declare_parameter("gmm_interp_steps", 5)
         self.declare_parameter("micro_goal_lock_radius", 0.25)
+        self.declare_parameter("macro_replan_radius", 0.6)
         self.declare_parameter("density_traj_steps", 8)
+        self.declare_parameter("density_use_astar", True)
+        self.declare_parameter("density_astar_safe_margin", 0.4)
+        self.declare_parameter("density_astar_robot_radius", 0.18)
         self.declare_parameter("slp_epsilon", 0.2)
         self.declare_parameter("use_gmm_trajectory_slp", True)
         self.declare_parameter("micro_controller", "apf")
@@ -73,10 +77,14 @@ class PlanningNode(Node):
         self._max_micro_try = int(self.get_parameter("max_micro_try").value)
         self._gmm_interp_steps = int(self.get_parameter("gmm_interp_steps").value)
         self._density_traj_steps = int(self.get_parameter("density_traj_steps").value)
+        self._density_use_astar = bool(self.get_parameter("density_use_astar").value)
+        self._density_astar_safe_margin = float(self.get_parameter("density_astar_safe_margin").value)
+        self._density_astar_robot_radius = float(self.get_parameter("density_astar_robot_radius").value)
 
         self._micro_goal_lock_radius = float(
             self.get_parameter("micro_goal_lock_radius").value
         )
+        self._macro_replan_radius = float(self.get_parameter("macro_replan_radius").value)
         self._slp_epsilon = float(self.get_parameter("slp_epsilon").value)
         self._use_gmm_trajectory_slp = bool(self.get_parameter("use_gmm_trajectory_slp").value)
         self._micro_controller = str(self.get_parameter("micro_controller").value).strip().lower()
@@ -113,6 +121,7 @@ class PlanningNode(Node):
         self._log_no_config_dir_done = False
         self._last_traj_log_time = 0.0
         self._first_publish_done = False
+        self._wait_log_last_ns: Dict[str, int] = {}
 
         for name in self._robot_names:
             self.create_subscription(
@@ -153,6 +162,20 @@ class PlanningNode(Node):
             f"Planning node: robots={self._robot_names}, goal={self._goal_topic}, "
             f"gmm_interp_steps={self._gmm_interp_steps}"
         )
+        self.get_logger().info(
+            "Waiting for prerequisites: "
+            f"(1) GMM on /{self._goal_topic} "
+            f"(2) ESDF shm {self.get_parameter('esdf_shm_name').value} "
+            f"(3) odom /{{robot}}/{self._odom_suffix} for each robot."
+        )
+
+    def _log_wait_throttled(self, key: str, message: str, period_sec: float = 5.0) -> None:
+        now_ns = self.get_clock().now().nanoseconds
+        period_ns = int(max(period_sec, 0.0) * 1e9)
+        prev = self._wait_log_last_ns.get(key)
+        if prev is None or (now_ns - prev) >= period_ns:
+            self._wait_log_last_ns[key] = now_ns
+            self.get_logger().warn(message)
 
     def _cb_odom(self, name: str, msg: Odometry) -> None:
         self._odom_cache[name] = msg
@@ -203,10 +226,20 @@ class PlanningNode(Node):
     def _control_loop(self) -> None:
         if self._gmm_goal is None:
             self._publish_empty_paths()
+            self._log_wait_throttled(
+                "no_gmm_goal",
+                f"Waiting for GMM goal on /{self._goal_topic}. "
+                "Publish once with: ros2 run rover3d_navigation publish_gmm_goal.py",
+            )
             return
         if hasattr(self._esdf, "refresh"):
             self._esdf.refresh()
         if hasattr(self._esdf, "is_ready") and not self._esdf.is_ready:
+            shm_name = str(self.get_parameter("esdf_shm_name").value)
+            self._log_wait_throttled(
+                "esdf_not_ready",
+                f"Waiting for ESDF shared memory {shm_name} (start FIESTA / simulation first).",
+            )
             return
         robots_positions = self._get_robots_positions()
         if robots_positions is None or len(robots_positions) == 0:
@@ -248,7 +281,11 @@ class PlanningNode(Node):
                 gmm_interp_steps=self._gmm_interp_steps,
                 max_micro_try=self._max_micro_try,
                 micro_goal_lock_radius=self._micro_goal_lock_radius,
+                macro_replan_radius=self._macro_replan_radius,
                 density_traj_steps=self._density_traj_steps,
+                density_use_astar=self._density_use_astar,
+                density_astar_safe_margin=self._density_astar_safe_margin,
+                density_astar_robot_radius=self._density_astar_robot_radius,
                 slp_epsilon=self._slp_epsilon,
                 use_gmm_trajectory_slp=self._use_gmm_trajectory_slp,
                 micro_controller=self._micro_controller,

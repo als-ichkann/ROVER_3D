@@ -338,7 +338,10 @@ def Optimization_SLP(
     print(f"[4] 路径表完成，耗时 {time.time() - start:.2f}s")
 
     if path_table.shape[0] == 0:
-        print("[4] 路径表为空（无可达路径），回退为直达目标（继续规划，未到达）")
+        print(
+            "[4] 路径表为空（无可达路径），保持当前宏观态 flag=-1 "
+            "（禁止直达最终目标，由上层原地 hold）"
+        )
         _, W_ot, _ = calWGMetric_speedUp(
             current_means, current_covs, current_weights,
             fmeans, fcovs, fweights
@@ -346,10 +349,18 @@ def Optimization_SLP(
         num_p = len(current_means)
         num_q = len(fmeans)
         W_tm = np.asarray(W_ot, dtype=float).reshape((num_q, num_p), order="F").T
+        hold_means = [list(m) for m in np.asarray(current_means, dtype=float).reshape(-1, 3)]
+        hold_covs = list(current_covs)
+        hold_weights = list(_normalize_weights(np.asarray(current_weights, dtype=float)))
         return (
-            fmeans, fcovs, fweights,
-            current_means, current_covs, current_weights,
-            W_tm, 0
+            hold_means,
+            hold_covs,
+            hold_weights,
+            current_means,
+            current_covs,
+            current_weights,
+            W_tm,
+            -1,
         )
 
     # --------------------------------------------------------
